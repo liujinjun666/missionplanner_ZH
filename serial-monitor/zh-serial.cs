@@ -65,7 +65,7 @@ namespace ZhSerial
         // ── 数据缓冲 ──
         readonly List<RowInfo> pending = new List<RowInfo>();
         System.Windows.Forms.Timer uiTimer;
-        bool paused;
+        volatile bool paused;
 
         // 过滤条件缓存：控件只能在 UI 线程读，收包线程用这几个快照
         volatile bool fltTextOnly;
@@ -1123,7 +1123,7 @@ namespace ZhSerial
 
         void Count(RowInfo r)
         {
-            Interlocked.Increment(ref cBytes);
+            if (r.Len > 0) Interlocked.Add(ref cBytes, r.Len);
             if (r.Sent) Interlocked.Increment(ref cTx); else Interlocked.Increment(ref cRx);
             if (r.IsAscii) Interlocked.Increment(ref cAscii);
             if (r.Raw == null) Interlocked.Increment(ref cErr);
