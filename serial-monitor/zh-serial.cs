@@ -1,9 +1,9 @@
-// zh-serial.cs —— 遥测通信监听 v1.0
+// zh-serial.cs —— 遥测通信监听 v1.1
 // 监听 MP 与飞控之间的 MAVLink 收发（双向），并提供：
 //   · 报文列表（时间/方向/消息/ID/系统组件/序号/长度/摘要）+ 字段反射与十六进制详情
 //   · 消息类型过滤（单选 / 多选）、方向过滤、关键字过滤、只看文本
 //   · 打印页：STATUSTEXT 按级别着色
-//   · 发送页：MAV_CMD 命令（可改 sysid/compid/7 个参数）、参数写入
+//   · 发送页：MAV_CMD 命令（每条命令自带专属参数控件，不用记 P1~P7）、参数写入
 //   · 暂停/清空/保存日志/导出原始帧
 using System;
 using System.Collections.Generic;
@@ -43,10 +43,19 @@ namespace ZhSerial
         public override string ToString() { return Name; }
     }
 
+    // 下拉项：常用命令
+    public class CmdItem
+    {
+        public int Id;                 // -1 = 自定义
+        public string Label = "";
+        public CmdItem(int id, string label) { Id = id; Label = label; }
+        public override string ToString() { return Label; }
+    }
+
     public class ZhSerialPlugin : MissionPlanner.Plugin.Plugin
     {
         public override string Name { get { return "ZhSerial"; } }
-        public override string Version { get { return "1.0"; } }
+        public override string Version { get { return "1.1"; } }
         public override string Author { get { return "local"; } }
 
         const int MaxRows = 5000;         // 列表保留行数
@@ -74,9 +83,11 @@ namespace ZhSerial
 
         // 发送页
         NumericUpDown numSys, numComp, numCmd;
-        NumericUpDown[] numP = new NumericUpDown[7];
         ComboBox cmbCmd;
-        Label lblCmdHint, lblSent;
+        Panel pnlArgs;                                   // 命令专属参数区（按所选命令重建）
+        readonly List<KeyValuePair<int, Func<float>>> argGet = new List<KeyValuePair<int, Func<float>>>();
+        int argY;
+        Label lblSent;
         TextBox txtParamName;
         NumericUpDown numParamValue;
 
@@ -527,50 +538,66 @@ namespace ZhSerial
 
         // ═══════════════════════ 发送页 ═══════════════════════
 
-        // 常用命令：ID + 显示名 + 参数提示
-        static readonly int[] CMD_IDS = new int[]
-        { 400, 22, 21, 20, 176, 178, 183, 179, 300, 511, 512, 246, 241, 16 };
-        static readonly string[] CMD_LABELS = new string[]
+        // 命令表：每条命令在 BuildArgs() 里有自己的一套参数控件
+        static readonly CmdItem[] CMDS = new CmdItem[]
         {
-            "400 · 解锁 / 上锁",
-            "22  · 起飞 TAKEOFF",
-            "21  · 降落 LAND",
-            "20  · 返航 RTL",
-            "176 · 设置模式 DO_SET_MODE",
-            "178 · 修改速度 CHANGE_SPEED",
-            "183 · 设置舵机 DO_SET_SERVO",
-            "179 · 设置 Home",
-            "300 · 开始任务 MISSION_START",
-            "511 · 设置消息频率 SET_MESSAGE_INTERVAL",
-            "512 · 请求消息 REQUEST_MESSAGE",
-            "246 · 重启飞控 REBOOT",
-            "241 · 预检校准 CALIBRATION",
-            "16  · 航点 NAV_WAYPOINT"
+            new CmdItem(400, "【飞行】400 · 解锁 / 上锁"),
+            new CmdItem(22,  "【飞行】22 · 起飞 TAKEOFF"),
+            new CmdItem(21,  "【飞行】21 · 降落 LAND"),
+            new CmdItem(20,  "【飞行】20 · 返航 RTL"),
+            new CmdItem(192, "【飞行】192 · 引导到指定点 DO_REPOSITION"),
+            new CmdItem(189, "【飞行】189 · 开始自动降落 DO_LAND_START"),
+            new CmdItem(16,  "【飞行】16 · 飞往航点 NAV_WAYPOINT"),
+            new CmdItem(176, "【模式】176 · 设置飞行模式 DO_SET_MODE"),
+            new CmdItem(300, "【任务】300 · 开始任务 MISSION_START"),
+            new CmdItem(193, "【任务】193 · 暂停 / 继续任务 DO_PAUSE_CONTINUE"),
+            new CmdItem(179, "【任务】179 · 设置 Home 点 DO_SET_HOME"),
+            new CmdItem(201, "【任务】201 · 设置 ROI 兴趣点 DO_SET_ROI_LOCATION"),
+            new CmdItem(197, "【任务】197 · 取消 ROI DO_SET_ROI_NONE"),
+            new CmdItem(178, "【调参】178 · 修改速度 DO_CHANGE_SPEED"),
+            new CmdItem(183, "【调参】183 · 设置舵机 PWM DO_SET_SERVO"),
+            new CmdItem(184, "【调参】184 · 重复舵机输出 DO_REPEAT_SERVO"),
+            new CmdItem(241, "【维护】241 · 预检校准 PREFLIGHT_CALIBRATION"),
+            new CmdItem(246, "【维护】246 · 重启 / 关闭飞控 PREFLIGHT_REBOOT_SHUTDOWN"),
+            new CmdItem(401, "【维护】401 · 运行预检检查 RUN_PREARM_CHECKS"),
+            new CmdItem(410, "【维护】410 · 读取 Home 点 GET_HOME_POSITION"),
+            new CmdItem(511, "【遥测】511 · 设置消息频率 SET_MESSAGE_INTERVAL"),
+            new CmdItem(512, "【遥测】512 · 请求消息 REQUEST_MESSAGE"),
+            new CmdItem(-1,  "自定义命令…（手填 ID 与参数）")
         };
-        static readonly string[] CMD_HINTS = new string[]
+
+        // Copter 模式号（不同机型编号不同，这里是多旋翼）
+        static readonly string[] COPTER_MODES = new string[]
         {
-            "P1 = 1 解锁 / 0 上锁；P2 = 21196 可强制（危险，飞控可能拒绝）",
-            "P7 = 起飞高度（米）；多旋翼需先解锁",
-            "P1 = 0 降落到当前位置",
-            "返航到 Home 点",
-            "P1 = 模式号（Copter：0Stab 1Acro 2AltHold 3Auto 4Guided 5Loiter 6RTL 7Circle 9Land 16PosHold 17Brake）；P2 = 1",
-            "P1 = 0 空速 / 1 地速；P2 = 速度 m/s",
-            "P1 = 舵机输出号；P2 = PWM（1000~2000）",
-            "P1 = 0 表示当前位置设为 Home",
-            "开始执行已上传的任务",
-            "P1 = 消息ID；P2 = 间隔(微秒)，-1 恢复默认 —— 用它提高/降低某类遥测频率",
-            "P1 = 消息ID，请求飞控立刻发一次",
-            "P1 = 1 重启飞控",
-            "P1 = 1 陀螺 / P2 = 1 磁罗盘 / P3 = 1 加速度计（谨慎，飞控会要求静止）",
-            "航点导航，一般由任务自动下发"
+            "STABILIZE", "ACRO", "ALT_HOLD", "AUTO", "GUIDED", "LOITER", "RTL", "CIRCLE",
+            "LAND", "DRIFT", "SPORT", "FLIP", "AUTOTUNE", "POSHOLD", "BRAKE", "THROW",
+            "AVOID_ADSB", "GUIDED_NOGPS", "SMART_RTL", "FLOWHOLD", "FOLLOW", "ZIGZAG",
+            "SYSTEMID", "AUTOROTATE", "AUTO_RTL"
         };
+        static readonly float[] COPTER_MODE_IDS = new float[]
+        {
+            0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27
+        };
+
+        // 全量消息类型（按 ID 排序），给 511/512 用
+        static List<KeyValuePair<uint, string>> msgList;
+        static List<KeyValuePair<uint, string>> AllMsgList()
+        {
+            if (msgList != null) return msgList;
+            List<KeyValuePair<uint, string>> l = new List<KeyValuePair<uint, string>>();
+            foreach (KeyValuePair<uint, string> kv in NameMap()) l.Add(kv);
+            l.Sort(delegate (KeyValuePair<uint, string> a, KeyValuePair<uint, string> b)
+            { return a.Key.CompareTo(b.Key); });
+            msgList = l;
+            return l;
+        }
 
         void BuildSendPage(TabPage page)
         {
             GroupBox g1 = new GroupBox();
             g1.Text = "发送 MAV_CMD 命令（COMMAND_LONG）";
             g1.Location = new Point(10, 8);
-            g1.Size = new Size(680, 182);
+            g1.Size = new Size(682, 340);
             g1.ForeColor = Color.Black;
             page.Controls.Add(g1);
 
@@ -614,16 +641,17 @@ namespace ZhSerial
             cmbCmd = new ComboBox();
             cmbCmd.DropDownStyle = ComboBoxStyle.DropDownList;
             cmbCmd.Location = new Point(300, 24);
-            cmbCmd.Width = 200;
-            cmbCmd.Items.AddRange(CMD_LABELS);
-            cmbCmd.SelectedIndex = 0;
-            cmbCmd.SelectedIndexChanged += delegate { SyncCmdFromCombo(); };
+            cmbCmd.Width = 300;
+            cmbCmd.DropDownWidth = 380;
+            cmbCmd.DropDownHeight = 330;
+            for (int i = 0; i < CMDS.Length; i++) cmbCmd.Items.Add(CMDS[i]);
+            cmbCmd.SelectedIndexChanged += delegate { OnCmdChanged(); };
             g1.Controls.Add(cmbCmd);
 
             Label l3 = new Label();
             l3.Text = "ID";
             l3.AutoSize = true;
-            l3.Location = new Point(510, 26);
+            l3.Location = new Point(608, 26);
             l3.ForeColor = Color.Black;
             g1.Controls.Add(l3);
 
@@ -631,42 +659,23 @@ namespace ZhSerial
             numCmd.Minimum = 0;
             numCmd.Maximum = 65535;
             numCmd.Value = 400;
-            numCmd.Location = new Point(534, 24);
-            numCmd.Width = 74;
-            numCmd.ValueChanged += delegate { SyncHint(); };
+            numCmd.Location = new Point(632, 24);
+            numCmd.Width = 62;
+            numCmd.ReadOnly = true;          // 预设命令的 ID 只读，选「自定义」才放开
             g1.Controls.Add(numCmd);
 
-            for (int i = 0; i < 7; i++)
-            {
-                Label lp = new Label();
-                lp.Text = "P" + (i + 1);
-                lp.AutoSize = true;
-                lp.Location = new Point(12 + (i % 4) * 164, 62 + (i / 4) * 34);
-                lp.ForeColor = Color.Black;
-                g1.Controls.Add(lp);
-
-                NumericUpDown n = new NumericUpDown();
-                n.Minimum = -1000000;
-                n.Maximum = 1000000;
-                n.DecimalPlaces = 3;
-                n.Increment = 1;
-                n.Location = new Point(38 + (i % 4) * 164, 60 + (i / 4) * 34);
-                n.Width = 104;
-                g1.Controls.Add(n);
-                numP[i] = n;
-            }
-
-            lblCmdHint = new Label();
-            lblCmdHint.AutoSize = false;
-            lblCmdHint.Location = new Point(12, 128);
-            lblCmdHint.Size = new Size(600, 18);
-            lblCmdHint.ForeColor = Color.FromArgb(90, 90, 90);
-            lblCmdHint.Text = CMD_HINTS[0];
-            g1.Controls.Add(lblCmdHint);
+            // 参数区：随所选命令重建（每行 30px，超出可滚动）
+            pnlArgs = new Panel();
+            pnlArgs.Location = new Point(10, 54);
+            pnlArgs.Size = new Size(682, 238);
+            pnlArgs.AutoScroll = true;
+            pnlArgs.BorderStyle = BorderStyle.FixedSingle;
+            pnlArgs.BackColor = Color.White;
+            g1.Controls.Add(pnlArgs);
 
             Button btnSend = new Button();
             btnSend.Text = "发送命令";
-            btnSend.Location = new Point(12, 148);
+            btnSend.Location = new Point(12, 302);
             btnSend.Size = new Size(96, 26);
             btnSend.Click += delegate { SendCommand(); };
             g1.Controls.Add(btnSend);
@@ -674,13 +683,13 @@ namespace ZhSerial
             Label l4 = new Label();
             l4.Text = "（发送后可在「报文」页看到发出的包和飞控回的 COMMAND_ACK）";
             l4.AutoSize = true;
-            l4.Location = new Point(116, 154);
+            l4.Location = new Point(116, 308);
             l4.ForeColor = Color.Gray;
             g1.Controls.Add(l4);
 
             GroupBox g2 = new GroupBox();
             g2.Text = "写入参数（PARAM_SET）";
-            g2.Location = new Point(10, 198);
+            g2.Location = new Point(10, 358);
             g2.Size = new Size(680, 74);
             g2.ForeColor = Color.Black;
             page.Controls.Add(g2);
@@ -730,29 +739,366 @@ namespace ZhSerial
 
             lblSent = new Label();
             lblSent.AutoSize = false;
-            lblSent.Location = new Point(10, 282);
-            lblSent.Size = new Size(680, 40);
+            lblSent.Location = new Point(10, 442);
+            lblSent.Size = new Size(690, 44);
             lblSent.ForeColor = Color.FromArgb(0, 110, 0);
             lblSent.Text = "尚未发送。";
             page.Controls.Add(lblSent);
+
+            cmbCmd.SelectedIndex = 0;      // 触发 OnCmdChanged → 生成第一条命令的参数控件
         }
 
-        void SyncCmdFromCombo()
+        // ═══════════════════════ 命令参数控件（按命令生成） ═══════════════════════
+
+        void OnCmdChanged()
         {
+            if (pnlArgs == null || cmbCmd == null) return;
             int idx = cmbCmd.SelectedIndex;
-            if (idx < 0 || idx >= CMD_IDS.Length) return;
-            try { numCmd.Value = CMD_IDS[idx]; } catch { }
-            SyncHint();
+            if (idx < 0 || idx >= CMDS.Length) return;
+            int id = CMDS[idx].Id;
+            bool custom = id < 0;
+            numCmd.ReadOnly = !custom;
+            if (!custom) { try { numCmd.Value = id; } catch { } }
+            BuildArgs(custom ? -1 : id);
         }
 
-        void SyncHint()
+        // 记录「第 n 个参数字段」的取值方式；送出前统一读出来填进 p1..p7
+        void Reg(int p, Func<float> get)
         {
-            if (lblCmdHint == null || lblCmdHint.IsDisposed) return;
-            int id = (int)numCmd.Value;
-            string hint = "自定义命令 ID：" + id + "（参数含义请查 MAV_CMD 表）";
-            for (int i = 0; i < CMD_IDS.Length; i++)
-                if (CMD_IDS[i] == id) { hint = CMD_HINTS[i]; break; }
-            lblCmdHint.Text = hint;
+            argGet.Add(new KeyValuePair<int, Func<float>>(p, get));
+        }
+
+        static float Pick(ComboBox c)
+        {
+            float[] v = c == null ? null : c.Tag as float[];
+            if (v == null || c.SelectedIndex < 0 || c.SelectedIndex >= v.Length) return 0f;
+            return v[c.SelectedIndex];
+        }
+
+        void ArgLabel(string text)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.AutoSize = true;
+            l.ForeColor = Color.Black;
+            l.Location = new Point(10, argY + 5);
+            pnlArgs.Controls.Add(l);
+        }
+
+        NumericUpDown ArgNum(string label, float def, float min, float max, int dec, string unit)
+        {
+            ArgLabel(label);
+            NumericUpDown n = new NumericUpDown();
+            n.Minimum = (decimal)min;
+            n.Maximum = (decimal)max;
+            n.DecimalPlaces = dec;
+            n.Increment = dec > 0 ? 0.5m : 1m;
+            decimal v = (decimal)def;
+            if (v < n.Minimum) v = n.Minimum;
+            if (v > n.Maximum) v = n.Maximum;
+            n.Value = v;
+            n.Location = new Point(160, argY);
+            n.Width = 110;
+            n.ForeColor = Color.Black;
+            pnlArgs.Controls.Add(n);
+            if (unit != null)
+            {
+                Label u = new Label();
+                u.Text = unit;
+                u.AutoSize = true;
+                u.ForeColor = Color.FromArgb(90, 90, 90);
+                u.Location = new Point(276, argY + 5);
+                pnlArgs.Controls.Add(u);
+            }
+            argY += 30;
+            return n;
+        }
+
+        ComboBox ArgCombo(string label, string[] names, float[] vals, float def)
+        {
+            ArgLabel(label);
+            ComboBox c = new ComboBox();
+            c.DropDownStyle = ComboBoxStyle.DropDownList;
+            c.Location = new Point(160, argY);
+            c.Width = 220;
+            for (int i = 0; i < names.Length; i++) c.Items.Add(names[i]);
+            int sel = 0;
+            for (int i = 0; i < vals.Length && i < names.Length; i++)
+                if (Math.Abs(vals[i] - def) < 0.001f) { sel = i; break; }
+            c.SelectedIndex = sel;
+            c.Tag = vals;
+            pnlArgs.Controls.Add(c);
+            argY += 30;
+            return c;
+        }
+
+        CheckBox ArgChk(string label, bool def)
+        {
+            CheckBox b = new CheckBox();
+            b.Text = label;
+            b.AutoSize = true;
+            b.Checked = def;
+            b.ForeColor = Color.Black;
+            b.Location = new Point(10, argY + 2);
+            pnlArgs.Controls.Add(b);
+            argY += 28;
+            return b;
+        }
+
+        void ArgNote(string text)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.AutoSize = false;
+            l.Size = new Size(640, 32);
+            l.ForeColor = Color.FromArgb(150, 70, 0);
+            l.Location = new Point(10, argY + 2);
+            pnlArgs.Controls.Add(l);
+            argY += 36;
+        }
+
+        ComboBox ArgMsgType(string label, float def)
+        {
+            List<KeyValuePair<uint, string>> all = AllMsgList();
+            string[] names = new string[all.Count];
+            float[] vals = new float[all.Count];
+            for (int i = 0; i < all.Count; i++)
+            {
+                names[i] = all[i].Key + " · " + all[i].Value;
+                vals[i] = all[i].Key;
+            }
+            ComboBox c = ArgCombo(label, names, vals, def);
+            c.DropDownWidth = 340;
+            c.DropDownHeight = 320;
+            return c;
+        }
+
+        float[] ReadArgs()
+        {
+            float[] p = new float[7];
+            for (int i = 0; i < argGet.Count; i++)
+            {
+                int k = argGet[i].Key;
+                if (k < 0 || k > 6) continue;
+                try { p[k] = argGet[i].Value(); } catch { }
+            }
+            return p;
+        }
+
+        void BuildArgs(int cmdId)
+        {
+            argGet.Clear();
+            argY = 6;
+            pnlArgs.SuspendLayout();
+            while (pnlArgs.Controls.Count > 0)
+            {
+                Control c = pnlArgs.Controls[0];
+                pnlArgs.Controls.RemoveAt(0);
+                c.Dispose();
+            }
+
+            switch (cmdId)
+            {
+                case 400:   // 解锁 / 上锁
+                    {
+                        ComboBox act = ArgCombo("动作", new string[] { "解锁（电机可转）", "上锁（电机锁定）" },
+                            new float[] { 1, 0 }, 1);
+                        Reg(0, delegate { return Pick(act); });
+                        CheckBox force = ArgChk("强制：跳过预检（等价 P2=21196）", false);
+                        Reg(1, delegate { return force.Checked ? 21196f : 0f; });
+                        ArgNote("解锁后电机具备动力。台架上请拆桨或可靠固定机体。");
+                        break;
+                    }
+                case 22:    // 起飞
+                    {
+                        NumericUpDown alt = ArgNum("起飞高度", 30, 1, 10000, 0, "米（相对起飞点）");
+                        Reg(6, delegate { return (float)alt.Value; });
+                        CheckBox cur = ArgChk("航向用当前机头（不指定则发 NaN）", true);
+                        NumericUpDown yaw = ArgNum("起飞航向", 0, 0, 359, 0, "度（0 = 正北）");
+                        yaw.Enabled = false;
+                        cur.CheckedChanged += delegate { yaw.Enabled = !cur.Checked; };
+                        Reg(3, delegate { return cur.Checked ? float.NaN : (float)yaw.Value; });
+                        ArgNote("多旋翼需先解锁并通过预检，飞控才会执行起飞。");
+                        break;
+                    }
+                case 21:    // 降落
+                    ArgNote("原地降落。落地后仍保持解锁状态，需要再发一次「上锁」。");
+                    break;
+                case 20:    // 返航
+                    ArgNote("返航到 Home 点，高度用参数 RTL_ALT。");
+                    break;
+                case 189:   // DO_LAND_START
+                    ArgNote("按任务里的降落序列开始自动降落（ArduPilot 4.x）。");
+                    break;
+                case 192:   // DO_REPOSITION
+                    {
+                        NumericUpDown lat = ArgNum("目标纬度", 0, -90, 90, 7, "度");
+                        NumericUpDown lon = ArgNum("目标经度", 0, -180, 180, 7, "度");
+                        NumericUpDown alt = ArgNum("目标高度", 30, -1, 10000, 0, "米（-1 = 保持当前）");
+                        NumericUpDown spd = ArgNum("飞行速度", -1, -1, 50, 1, "m/s（-1 = 用当前速度）");
+                        Reg(4, delegate { return (float)lat.Value; });
+                        Reg(5, delegate { return (float)lon.Value; });
+                        Reg(6, delegate { return (float)alt.Value; });
+                        Reg(0, delegate { return (float)spd.Value; });
+                        ArgNote("GUIDED 模式下飞往指定坐标；纬度经度填 0 会被当作无效目标。");
+                        break;
+                    }
+                case 16:    // NAV_WAYPOINT
+                    {
+                        NumericUpDown lat = ArgNum("纬度", 0, -90, 90, 7, "度");
+                        NumericUpDown lon = ArgNum("经度", 0, -180, 180, 7, "度");
+                        NumericUpDown alt = ArgNum("高度", 30, -100, 10000, 0, "米");
+                        NumericUpDown hold = ArgNum("停留时间", 0, 0, 3600, 0, "秒");
+                        Reg(4, delegate { return (float)lat.Value; });
+                        Reg(5, delegate { return (float)lon.Value; });
+                        Reg(6, delegate { return (float)alt.Value; });
+                        Reg(0, delegate { return (float)hold.Value; });
+                        ArgNote("单点飞往；连续航线请用任务（MISSION_ITEM）上传。");
+                        break;
+                    }
+                case 176:   // DO_SET_MODE
+                    {
+                        ComboBox m = ArgCombo("飞行模式（多旋翼）", COPTER_MODES, COPTER_MODE_IDS, 5);
+                        Reg(0, delegate { return 1f; });              // param1 = 自定义模式标志
+                        Reg(1, delegate { return Pick(m); });         // param2 = 模式号
+                        ArgNote("编码方式与 QGC / DroneKit 一致：param1 置「自定义模式」标志，param2 装模式号。"
+                              + "不同机型模式号不同，上表是多旋翼（Copter）；固定翼请用「自定义命令」直接填。");
+                        break;
+                    }
+                case 300:   // MISSION_START
+                    {
+                        NumericUpDown first = ArgNum("起始航点序号", 1, 0, 1000, 0, "从 0 开始");
+                        NumericUpDown last = ArgNum("结束航点序号", 0, 0, 1000, 0, "0 = 执行到末尾");
+                        Reg(0, delegate { return (float)first.Value; });
+                        Reg(1, delegate { return (float)last.Value; });
+                        ArgNote("要求飞控处于 AUTO 模式，且任务已上传。");
+                        break;
+                    }
+                case 193:   // DO_PAUSE_CONTINUE
+                    {
+                        ComboBox act = ArgCombo("动作", new string[] { "暂停任务", "继续任务" },
+                            new float[] { 0, 1 }, 0);
+                        Reg(0, delegate { return Pick(act); });
+                        break;
+                    }
+                case 179:   // DO_SET_HOME
+                    {
+                        ComboBox whereBox = ArgCombo("Home 位置", new string[] { "用当前位置", "用下面填的坐标" },
+                            new float[] { 1, 0 }, 1);
+                        NumericUpDown lat = ArgNum("纬度", 0, -90, 90, 7, "度");
+                        NumericUpDown lon = ArgNum("经度", 0, -180, 180, 7, "度");
+                        NumericUpDown alt = ArgNum("高度", 0, -1000, 10000, 1, "米");
+                        Reg(0, delegate { return Pick(whereBox); });
+                        Reg(4, delegate { return (float)lat.Value; });
+                        Reg(5, delegate { return (float)lon.Value; });
+                        Reg(6, delegate { return (float)alt.Value; });
+                        break;
+                    }
+                case 201:   // DO_SET_ROI_LOCATION
+                    {
+                        NumericUpDown lat = ArgNum("ROI 纬度", 0, -90, 90, 7, "度");
+                        NumericUpDown lon = ArgNum("ROI 经度", 0, -180, 180, 7, "度");
+                        NumericUpDown alt = ArgNum("ROI 高度", 0, -1000, 10000, 0, "米");
+                        Reg(4, delegate { return (float)lat.Value; });
+                        Reg(5, delegate { return (float)lon.Value; });
+                        Reg(6, delegate { return (float)alt.Value; });
+                        ArgNote("让机头/云台持续对准该点，用于绕点观察。");
+                        break;
+                    }
+                case 197:
+                    ArgNote("取消当前 ROI，机头恢复自由控制。");
+                    break;
+                case 178:   // DO_CHANGE_SPEED
+                    {
+                        ComboBox kind = ArgCombo("速度类型", new string[] { "地速", "空速" },
+                            new float[] { 1, 0 }, 1);
+                        NumericUpDown spd = ArgNum("速度", 5, 0, 100, 1, "m/s");
+                        NumericUpDown thr = ArgNum("油门", -1, -1, 100, 0, "%（-1 = 不改）");
+                        Reg(0, delegate { return Pick(kind); });
+                        Reg(1, delegate { return (float)spd.Value; });
+                        Reg(2, delegate { return (float)thr.Value; });
+                        break;
+                    }
+                case 183:   // DO_SET_SERVO
+                    {
+                        NumericUpDown no = ArgNum("舵机输出号", 1, 1, 32, 0, "号（SERVOn）");
+                        NumericUpDown pwm = ArgNum("PWM", 1500, 800, 2200, 0, "微秒");
+                        Reg(0, delegate { return (float)no.Value; });
+                        Reg(1, delegate { return (float)pwm.Value; });
+                        ArgNote("舵机功能需先设为「RC 直通 / 脚本控制」，否则被飞控逻辑覆盖。");
+                        break;
+                    }
+                case 184:   // DO_REPEAT_SERVO
+                    {
+                        NumericUpDown no = ArgNum("舵机输出号", 1, 1, 32, 0, "号");
+                        NumericUpDown pwm = ArgNum("PWM", 1500, 800, 2200, 0, "微秒");
+                        NumericUpDown cnt = ArgNum("重复次数", 5, 1, 1000, 0, "次");
+                        NumericUpDown per = ArgNum("周期", 1000, 10, 60000, 0, "毫秒");
+                        Reg(0, delegate { return (float)no.Value; });
+                        Reg(1, delegate { return (float)pwm.Value; });
+                        Reg(2, delegate { return (float)cnt.Value; });
+                        Reg(3, delegate { return (float)per.Value; });
+                        break;
+                    }
+                case 241:   // PREFLIGHT_CALIBRATION
+                    {
+                        CheckBox gyro = ArgChk("陀螺仪（飞控需静止）", false);
+                        CheckBox mag = ArgChk("磁罗盘（需远离金属，转动机体）", false);
+                        CheckBox acc = ArgChk("加速度计（需水平静置）", false);
+                        Reg(0, delegate { return gyro.Checked ? 1f : 0f; });
+                        Reg(1, delegate { return mag.Checked ? 1f : 0f; });
+                        Reg(4, delegate { return acc.Checked ? 1f : 0f; });
+                        ArgNote("校准会持续几十秒到几分钟，期间飞控不可解锁。");
+                        break;
+                    }
+                case 246:   // PREFLIGHT_REBOOT_SHUTDOWN
+                    {
+                        ComboBox act = ArgCombo("动作", new string[] { "重启飞控", "关闭飞控", "重启板载计算机" },
+                            new float[] { 1, 2, 3 }, 1);
+                        Reg(0, delegate { return Pick(act); });
+                        ArgNote("重启会让 MAVLink 链路断开几秒，本窗口会出现「MP 未连接」，属正常。");
+                        break;
+                    }
+                case 401:
+                    ArgNote("立刻重新跑一遍预检，结果以 STATUSTEXT 形式出现在「打印」页。");
+                    break;
+                case 410:
+                    ArgNote("请求飞控回传 Home 点，结果看「报文」页的 HOME_POSITION。");
+                    break;
+                case 511:   // SET_MESSAGE_INTERVAL
+                    {
+                        ComboBox mt = ArgMsgType("消息类型", 0);
+                        NumericUpDown hz = ArgNum("频率", 2, 0.1f, 50, 1, "Hz（越大越刷屏）");
+                        CheckBox reset = ArgChk("恢复飞控默认频率", false);
+                        hz.Enabled = !reset.Checked;
+                        reset.CheckedChanged += delegate { hz.Enabled = !reset.Checked; };
+                        Reg(0, delegate { return Pick(mt); });
+                        Reg(1, delegate { return reset.Checked ? -1f : 1000000f / Math.Max(0.1f, (float)hz.Value); });
+                        ArgNote("只在本次上电有效；重启飞控后回到默认频率。");
+                        break;
+                    }
+                case 512:   // REQUEST_MESSAGE
+                    {
+                        ComboBox mt = ArgMsgType("消息类型", 0);
+                        Reg(0, delegate { return Pick(mt); });
+                        ArgNote("请求飞控立刻发一次该消息，比等它自然上报快。");
+                        break;
+                    }
+                default:    // 自定义命令
+                    {
+                        ArgNote("自定义命令：ID 在右上角填，下面 7 个参数的含义务必查 MAV_CMD 表。");
+                        for (int i = 0; i < 7; i++)
+                        {
+                            NumericUpDown n = ArgNum("参数 " + (i + 1), 0, -1000000, 1000000, 4, null);
+                            int k = i;
+                            Reg(k, delegate { return (float)n.Value; });
+                        }
+                        break;
+                    }
+            }
+
+            pnlArgs.ResumeLayout();
+            pnlArgs.AutoScrollPosition = new Point(0, 0);
         }
 
         bool EnsureConnected()
@@ -774,11 +1120,11 @@ namespace ZhSerial
             byte sysid = (byte)numSys.Value;   // MP 1.3.83 的重载是 (byte sysid, byte compid, ...)
             byte compid = (byte)numComp.Value;
             int cmdId = (int)numCmd.Value;
-            float[] p = new float[7];
-            for (int i = 0; i < 7; i++) p[i] = (float)numP[i].Value;
+            float[] p = ReadArgs();            // 由每条命令自己的控件填出来
 
             string arg = "";
-            for (int i = 0; i < 7; i++) arg += (i > 0 ? " " : "") + p[i].ToString("0.###");
+            for (int i = 0; i < 7; i++)
+                arg += (i > 0 ? " " : "") + (float.IsNaN(p[i]) ? "NaN" : p[i].ToString("0.###"));
             PrintSys("→ 发送 COMMAND_LONG cmd=" + cmdId + "  " + arg);
             lblSent.ForeColor = Color.Gray;
             lblSent.Text = "正在发送 cmd=" + cmdId + " …";
