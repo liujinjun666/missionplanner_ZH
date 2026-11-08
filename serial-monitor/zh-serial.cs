@@ -771,7 +771,7 @@ namespace ZhSerial
         void SendCommand()
         {
             if (!EnsureConnected()) return;
-            uint sysid = (uint)numSys.Value;
+            byte sysid = (byte)numSys.Value;   // MP 1.3.83 的重载是 (byte sysid, byte compid, ...)
             byte compid = (byte)numComp.Value;
             int cmdId = (int)numCmd.Value;
             float[] p = new float[7];
@@ -817,7 +817,7 @@ namespace ZhSerial
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            uint sysid = (uint)numSys.Value;
+            byte sysid = (byte)numSys.Value;
             byte compid = (byte)numComp.Value;
             double val = (double)numParamValue.Value;
 
