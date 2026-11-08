@@ -132,18 +132,23 @@ namespace ZhSerial
             if (uiAdded) return;
             Form mf = Host.MainForm as Form;
             if (mf == null || mf.IsDisposed) return;
+            retries++;
 
-            // 优先挂在「飞控网口」右侧，其次「玄云ECU」，都没有就等一会儿
+            // 位置约定：排在「飞控网口」勾选框右侧。
+            // 但 zh-net 自己也是靠「玄云ECU」定位的，如果本插件先跑完全，就会占到它的位置，
+            // 等 zh-net 注入时又按 ecu.Right+8 算，两个框会叠在一起 —— 所以先等「飞控网口」出现。
             CheckBox anchor = FindControl<CheckBox>(mf, "CHK_net");
+            if (anchor == null && retries < 8) return;          // 最多等 8 秒（loopratehz = 1）
+
             if (anchor == null) anchor = FindControl<CheckBox>(mf, "CHK_ecu");
             if (anchor == null)
             {
                 anchor = FindCheckByText(mf, "飞控网口");
+                if (anchor == null) anchor = FindCheckByText(mf, "玄云ECU");
                 if (anchor == null) anchor = FindCheckByText(mf, "自动平移");
             }
             if (anchor == null)
             {
-                retries++;
                 if (retries < 40) return;
                 // 兜底：加到「飞行数据」页菜单里
                 try
