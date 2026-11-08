@@ -1,7 +1,10 @@
-// zh-serial.cs —— 飞控串口监听工具 v1.0
-// 两种源：① MP 当前连接（挂在 MAVLink 收发事件上，零配置）② 飞控串口（自动定位飞控 COM 口，可接管 MP 占用的串口）
-// 内容：报文列表（时间/方向/消息/ID/系统组件/序号/长度/摘要）+ 选中行字段与十六进制
-//       打印页（STATUSTEXT 告警文本 + 串口 ASCII 调试行）+ 过滤/暂停/保存/导出原始帧
+// zh-serial.cs —— 遥测通信监听 v1.0
+// 监听 MP 与飞控之间的 MAVLink 收发（双向），并提供：
+//   · 报文列表（时间/方向/消息/ID/系统组件/序号/长度/摘要）+ 字段反射与十六进制详情
+//   · 消息类型过滤（单选 / 多选）、方向过滤、关键字过滤、只看文本
+//   · 打印页：STATUSTEXT 按级别着色
+//   · 发送页：MAV_CMD 命令（可改 sysid/compid/7 个参数）、参数写入
+//   · 暂停/清空/保存日志/导出原始帧
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -19,7 +22,6 @@ namespace ZhSerial
     {
         public DateTime Time;
         public bool Sent;          // true=发送
-        public bool IsAscii;       // 串口 ASCII 调试行（非 MAVLink）
         public uint MsgId;
         public string Name = "";
         public int SysId;
@@ -29,7 +31,16 @@ namespace ZhSerial
         public int Payload;
         public string Content = "";
         public byte[] Raw;
-        public object Data;        // MAVLink 解析后的结构体（飞控串口模式为 null）
+        public object Data;        // MAVLink 解析后的结构体
+    }
+
+    // 下拉项：消息类型
+    public class TypeItem
+    {
+        public uint Id;
+        public string Name = "";
+        public TypeItem(uint id, string name) { Id = id; Name = name; }
+        public override string ToString() { return Name; }
     }
 
     public class ZhSerialPlugin : MissionPlanner.Plugin.Plugin
@@ -54,45 +65,41 @@ namespace ZhSerial
         TextBox txtDetail;
         RichTextBox txtPrint;
         SplitContainer split;
-        RadioButton rbMp, rbPort;
-        ComboBox cmbPort, cmbBaud, cmbDir;
-        Button btnOpen, btnRefresh, btnScan, btnPause, btnClear, btnSave, btnRaw;
         TextBox txtFilter;
+        ComboBox cmbMsgType, cmbDir;
         CheckBox chkTextOnly, chkAutoScroll, chkTopMost;
+        Button btnPause, btnClear, btnSave, btnRaw, btnPickType;
         Label lblSrc, lblState;
         ToolStripStatusLabel lblCnt, lblRate;
 
-        // ── 飞控串口（SERIALn）视图 ──
-        TabPage tabPorts;
-        DataGridView gridPorts;
-        Label lblPortHint;
-        readonly Dictionary<int, int> portProto = new Dictionary<int, int>();
-        readonly Dictionary<int, double> portBaud = new Dictionary<int, double>();
-        int filterPort = -1;                 // -1 = 不过滤
-        HashSet<uint> filterIds;
-        int portAutoTick;
+        // 发送页
+        NumericUpDown numSys, numComp, numCmd;
+        NumericUpDown[] numP = new NumericUpDown[7];
+        ComboBox cmbCmd;
+        Label lblCmdHint, lblSent;
+        TextBox txtParamName;
+        NumericUpDown numParamValue;
 
         // ── 数据缓冲 ──
         readonly List<RowInfo> pending = new List<RowInfo>();
         System.Windows.Forms.Timer uiTimer;
         volatile bool paused;
+        long cRx, cTx, cBytes, cDrop;
+        long lastBytes;
 
-        // 过滤条件缓存：控件只能在 UI 线程读，收包线程用这几个快照
+        // 过滤条件快照（收包线程只读）
         volatile bool fltTextOnly;
         volatile int fltDir;
         volatile string fltText = "";
-        long cRx, cTx, cAscii, cErr, cBytes, cDrop;
-        long lastBytes;
+        HashSet<uint> selTypes;              // null = 全部；整体替换，不原地改
+
+        // 已见过的消息类型（供类型下拉使用）
+        readonly object typeLock = new object();
+        readonly HashSet<uint> typeSeen = new HashSet<uint>();
+        readonly List<TypeItem> typePending = new List<TypeItem>();
 
         // ── MP 事件挂钩 ──
         MissionPlanner.MAVLinkInterface attached;
-
-        // ── 飞控串口 ──
-        System.IO.Ports.SerialPort sp;
-        Thread th;
-        volatile bool running;
-        readonly List<byte> rbuf = new List<byte>();
-        bool closing;
 
         // ═══════════════════════ 插件入口 ═══════════════════════
 
@@ -117,9 +124,9 @@ namespace ZhSerial
                 Form mf = Host.MainForm as Form;
                 if (mf == null || mf.IsDisposed) return true;
                 if (mf.InvokeRequired)
-                    mf.BeginInvoke((Action)delegate { EnsureUI(); AttachMp(); UpdateSrc(); AutoPorts(); });
+                    mf.BeginInvoke((Action)delegate { EnsureUI(); AttachMp(); UpdateSrc(); });
                 else
-                { EnsureUI(); AttachMp(); UpdateSrc(); AutoPorts(); }
+                { EnsureUI(); AttachMp(); UpdateSrc(); }
             }
             catch { }
             return true;
@@ -127,9 +134,7 @@ namespace ZhSerial
 
         public override bool Exit()
         {
-            closing = true;
             try { DetachMp(); } catch { }
-            try { ClosePort(); } catch { }
             try { if (uiTimer != null) uiTimer.Stop(); } catch { }
             try { if (fm != null && !fm.IsDisposed) fm.Dispose(); } catch { }
             return true;
@@ -145,8 +150,7 @@ namespace ZhSerial
             retries++;
 
             // 位置约定：排在「飞控网口」勾选框右侧。
-            // 但 zh-net 自己也是靠「玄云ECU」定位的，如果本插件先跑完全，就会占到它的位置，
-            // 等 zh-net 注入时又按 ecu.Right+8 算，两个框会叠在一起 —— 所以先等「飞控网口」出现。
+            // zh-net 是靠「玄云ECU」定位的，如果本插件先跑完就会占它的位置，所以要等 CHK_net 出现。
             CheckBox anchor = FindControl<CheckBox>(mf, "CHK_net");
             if (anchor == null && retries < 8) return;          // 最多等 8 秒（loopratehz = 1）
 
@@ -160,10 +164,9 @@ namespace ZhSerial
             if (anchor == null)
             {
                 if (retries < 40) return;
-                // 兜底：加到「飞行数据」页菜单里
                 try
                 {
-                    ToolStripMenuItem mi = new ToolStripMenuItem("串口监听");
+                    ToolStripMenuItem mi = new ToolStripMenuItem("遥测通信监听");
                     mi.Click += delegate { ToggleForm(); };
                     Host.FDMenuMap.Items.Add(mi);
                 }
@@ -173,7 +176,7 @@ namespace ZhSerial
             }
 
             chkEntry = new CheckBox();
-            chkEntry.Text = "串口监听";
+            chkEntry.Text = "遥测通信监听";
             chkEntry.AutoSize = true;
             chkEntry.Name = "CHK_serial";
             chkEntry.Checked = false;
@@ -183,8 +186,8 @@ namespace ZhSerial
             parent.Controls.Add(chkEntry);
             chkEntry.BringToFront();
             int x = anchor.Right + 8;
-            if (x + 96 > parent.ClientSize.Width)
-                x = Math.Max(0, parent.ClientSize.Width - 96);
+            if (x + 104 > parent.ClientSize.Width)
+                x = Math.Max(0, parent.ClientSize.Width - 104);
             chkEntry.Location = new Point(x, anchor.Top);
             uiAdded = true;
         }
@@ -235,13 +238,10 @@ namespace ZhSerial
 
         void FmClosing(object s, FormClosingEventArgs e)
         {
-            if (closing) return;
-            if (e.CloseReason == CloseReason.UserClosing)
-            {
-                e.Cancel = true;
-                fm.Hide();
-                try { if (chkEntry != null) chkEntry.Checked = false; } catch { }
-            }
+            if (e.CloseReason != CloseReason.UserClosing) return;
+            e.Cancel = true;
+            fm.Hide();
+            try { if (chkEntry != null) chkEntry.Checked = false; } catch { }
         }
 
         // ═══════════════════════ 界面构建 ═══════════════════════
@@ -251,9 +251,9 @@ namespace ZhSerial
             if (fm != null && !fm.IsDisposed) return;
 
             fm = new Form();
-            fm.Text = "飞控串口监听 v" + Version;
-            fm.Size = new Size(1000, 680);
-            fm.MinimumSize = new Size(840, 500);
+            fm.Text = "遥测通信监听 v" + Version;
+            fm.Size = new Size(1020, 700);
+            fm.MinimumSize = new Size(880, 540);
             fm.StartPosition = FormStartPosition.CenterScreen;
             fm.ShowIcon = false;
             fm.ShowInTaskbar = true;
@@ -265,112 +265,24 @@ namespace ZhSerial
 
             Panel top = new Panel();
             top.Dock = DockStyle.Top;
-            top.Height = 102;
+            top.Height = 78;
             fm.Controls.Add(top);
 
-            // ── 第一行：数据源 ──
-            rbMp = new RadioButton();
-            rbMp.Text = "MP 当前连接";
-            rbMp.AutoSize = true;
-            rbMp.Checked = true;
-            rbMp.Location = new Point(10, 12);
-            rbMp.CheckedChanged += ModeChanged;
-            top.Controls.Add(rbMp);
-
-            rbPort = new RadioButton();
-            rbPort.Text = "PC 串口";
-            rbPort.AutoSize = true;
-            rbPort.Location = new Point(150, 12);
-            rbPort.CheckedChanged += ModeChanged;
-            top.Controls.Add(rbPort);
-
-            cmbPort = new ComboBox();
-            cmbPort.DropDownStyle = ComboBoxStyle.DropDownList;   // 只从识别结果里选，避免手打出错
-            cmbPort.Location = new Point(242, 10);
-            cmbPort.Width = 96;
-            top.Controls.Add(cmbPort);
-
-            cmbBaud = new ComboBox();
-            cmbBaud.DropDownStyle = ComboBoxStyle.DropDown;
-            cmbBaud.Location = new Point(346, 10);
-            cmbBaud.Width = 96;
-            cmbBaud.Items.AddRange(new object[] { "9600", "19200", "38400", "57600", "115200",
-                "230400", "460800", "500000", "921600", "1000000", "1500000", "2000000", "3000000" });
-            cmbBaud.Text = "57600";
-            top.Controls.Add(cmbBaud);
-
-            btnOpen = new Button();
-            btnOpen.Text = "打开";
-            btnOpen.Location = new Point(450, 9);
-            btnOpen.Size = new Size(70, 25);
-            btnOpen.Click += delegate { if (sp == null) OpenPort(); else ClosePort(); };
-            top.Controls.Add(btnOpen);
-
-            btnRefresh = new Button();
-            btnRefresh.Text = "刷新";
-            btnRefresh.Location = new Point(526, 9);
-            btnRefresh.Size = new Size(60, 25);
-            btnRefresh.Click += delegate { RefreshPorts(); };
-            top.Controls.Add(btnRefresh);
-
-            btnScan = new Button();
-            btnScan.Text = "自动扫描波特率";
-            btnScan.Location = new Point(592, 9);
-            btnScan.Size = new Size(116, 25);
-            btnScan.Click += delegate { ScanBaud(); };
-            top.Controls.Add(btnScan);
-
+            // ── 第一行：源 + 操作按钮 ──
             lblSrc = new Label();
-            lblSrc.Text = "未连接";
+            lblSrc.Text = "源：MP 未连接";
             lblSrc.AutoSize = false;
             lblSrc.TextAlign = ContentAlignment.MiddleLeft;
-            lblSrc.Location = new Point(720, 12);
-            lblSrc.Size = new Size(260, 20);
+            lblSrc.Location = new Point(10, 8);
+            lblSrc.Size = new Size(430, 22);
             lblSrc.ForeColor = Color.Black;
-            lblSrc.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             top.Controls.Add(lblSrc);
 
-            // ── 第二行：过滤 ──
-            Label lf = new Label();
-            lf.Text = "过滤：";
-            lf.AutoSize = true;
-            lf.Location = new Point(10, 47);
-            lf.ForeColor = Color.Black;
-            top.Controls.Add(lf);
-
-            txtFilter = new TextBox();
-            txtFilter.Location = new Point(56, 44);
-            txtFilter.Width = 300;
-            txtFilter.BorderStyle = BorderStyle.FixedSingle;
-            txtFilter.Text = "";
-            top.Controls.Add(txtFilter);
-
-            Label lh = new Label();
-            lh.Text = "多个关键字用逗号分隔（匹配消息名或内容）";
-            lh.AutoSize = true;
-            lh.Location = new Point(362, 47);
-            lh.ForeColor = Color.Gray;
-            top.Controls.Add(lh);
-
-            cmbDir = new ComboBox();
-            cmbDir.DropDownStyle = ComboBoxStyle.DropDownList;
-            cmbDir.Location = new Point(640, 44);
-            cmbDir.Width = 86;
-            cmbDir.Items.AddRange(new object[] { "全部方向", "仅接收", "仅发送" });
-            cmbDir.SelectedIndex = 0;
-            top.Controls.Add(cmbDir);
-
-            chkTextOnly = new CheckBox();
-            chkTextOnly.Text = "只看文本/打印";
-            chkTextOnly.AutoSize = true;
-            chkTextOnly.Location = new Point(736, 46);
-            top.Controls.Add(chkTextOnly);
-
-            // ── 第三行：操作 ──
             btnPause = new Button();
             btnPause.Text = "暂停";
-            btnPause.Location = new Point(10, 72);
-            btnPause.Size = new Size(70, 25);
+            btnPause.Location = new Point(548, 6);
+            btnPause.Size = new Size(70, 26);
+            btnPause.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             btnPause.Click += delegate
             {
                 paused = !paused;
@@ -381,52 +293,110 @@ namespace ZhSerial
 
             btnClear = new Button();
             btnClear.Text = "清空";
-            btnClear.Location = new Point(86, 72);
-            btnClear.Size = new Size(70, 25);
+            btnClear.Location = new Point(624, 6);
+            btnClear.Size = new Size(70, 26);
+            btnClear.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             btnClear.Click += delegate { ClearAll(); };
             top.Controls.Add(btnClear);
 
             btnSave = new Button();
             btnSave.Text = "保存日志";
-            btnSave.Location = new Point(162, 72);
-            btnSave.Size = new Size(86, 25);
+            btnSave.Location = new Point(700, 6);
+            btnSave.Size = new Size(88, 26);
+            btnSave.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             btnSave.Click += delegate { SaveLog(); };
             top.Controls.Add(btnSave);
 
             btnRaw = new Button();
             btnRaw.Text = "导出原始帧";
-            btnRaw.Location = new Point(254, 72);
-            btnRaw.Size = new Size(100, 25);
+            btnRaw.Location = new Point(794, 6);
+            btnRaw.Size = new Size(100, 26);
+            btnRaw.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             btnRaw.Click += delegate { ExportRaw(); };
             top.Controls.Add(btnRaw);
+
+            chkTopMost = new CheckBox();
+            chkTopMost.Text = "置顶";
+            chkTopMost.AutoSize = true;
+            chkTopMost.Location = new Point(904, 11);
+            chkTopMost.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            chkTopMost.CheckedChanged += delegate { try { fm.TopMost = chkTopMost.Checked; } catch { } };
+            top.Controls.Add(chkTopMost);
+
+            // ── 第二行：过滤 ──
+            Label lf = new Label();
+            lf.Text = "关键字：";
+            lf.AutoSize = true;
+            lf.Location = new Point(10, 49);
+            lf.ForeColor = Color.Black;
+            top.Controls.Add(lf);
+
+            txtFilter = new TextBox();
+            txtFilter.Location = new Point(64, 46);
+            txtFilter.Width = 180;
+            txtFilter.BorderStyle = BorderStyle.FixedSingle;
+            top.Controls.Add(txtFilter);
+
+            Label lt = new Label();
+            lt.Text = "消息类型：";
+            lt.AutoSize = true;
+            lt.Location = new Point(254, 49);
+            lt.ForeColor = Color.Black;
+            top.Controls.Add(lt);
+
+            cmbMsgType = new ComboBox();
+            cmbMsgType.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbMsgType.Location = new Point(324, 46);
+            cmbMsgType.Width = 168;
+            cmbMsgType.Items.Add("全部消息类型");
+            cmbMsgType.SelectedIndex = 0;
+            cmbMsgType.SelectedIndexChanged += delegate { OnTypeChanged(); };
+            top.Controls.Add(cmbMsgType);
+
+            btnPickType = new Button();
+            btnPickType.Text = "多选…";
+            btnPickType.Location = new Point(498, 45);
+            btnPickType.Size = new Size(64, 24);
+            btnPickType.Click += delegate { PickTypes(); };
+            top.Controls.Add(btnPickType);
+
+            cmbDir = new ComboBox();
+            cmbDir.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbDir.Location = new Point(570, 46);
+            cmbDir.Width = 86;
+            cmbDir.Items.AddRange(new object[] { "全部方向", "仅接收", "仅发送" });
+            cmbDir.SelectedIndex = 0;
+            top.Controls.Add(cmbDir);
+
+            chkTextOnly = new CheckBox();
+            chkTextOnly.Text = "只看文本/打印";
+            chkTextOnly.AutoSize = true;
+            chkTextOnly.Location = new Point(666, 48);
+            top.Controls.Add(chkTextOnly);
 
             chkAutoScroll = new CheckBox();
             chkAutoScroll.Text = "自动滚动";
             chkAutoScroll.AutoSize = true;
             chkAutoScroll.Checked = true;
-            chkAutoScroll.Location = new Point(368, 76);
+            chkAutoScroll.Location = new Point(778, 48);
+            chkAutoScroll.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             top.Controls.Add(chkAutoScroll);
-
-            chkTopMost = new CheckBox();
-            chkTopMost.Text = "窗口置顶";
-            chkTopMost.AutoSize = true;
-            chkTopMost.Location = new Point(462, 76);
-            chkTopMost.CheckedChanged += delegate { try { fm.TopMost = chkTopMost.Checked; } catch { } };
-            top.Controls.Add(chkTopMost);
 
             lblState = new Label();
             lblState.Text = "就绪";
             lblState.AutoSize = true;
-            lblState.Location = new Point(556, 78);
+            lblState.Location = new Point(868, 49);
             lblState.ForeColor = Color.FromArgb(0, 110, 0);
+            lblState.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             top.Controls.Add(lblState);
 
-            // ── 主体 ──
+            // ── 页签 ──
             tabs = new TabControl();
             tabs.Dock = DockStyle.Fill;
             fm.Controls.Add(tabs);
-            fm.Controls.SetChildIndex(tabs, 0);   // Fill 必须排在最前，先分给 Top/Bottom 再填满
+            fm.Controls.SetChildIndex(tabs, 0);   // Fill 排最前，先分给 Top/Bottom 再填满
 
+            // ── 报文页 ──
             TabPage p1 = new TabPage("报文");
             p1.BackColor = Color.White;
             tabs.TabPages.Add(p1);
@@ -501,6 +471,13 @@ namespace ZhSerial
             dp.Controls.Add(txtDetail);
             txtDetail.BringToFront();
 
+            // ── 发送页 ──
+            TabPage pSend = new TabPage("发送");
+            pSend.BackColor = Color.White;
+            tabs.TabPages.Add(pSend);
+            BuildSendPage(pSend);
+
+            // ── 打印页 ──
             TabPage p2 = new TabPage("打印");
             p2.BackColor = Color.White;
             tabs.TabPages.Add(p2);
@@ -515,84 +492,6 @@ namespace ZhSerial
             txtPrint.BorderStyle = BorderStyle.None;
             p2.Controls.Add(txtPrint);
 
-            // ── 飞控串口（SERIALn）视图 ──
-            tabPorts = new TabPage("飞控串口");
-            tabPorts.BackColor = Color.White;
-            tabs.TabPages.Add(tabPorts);
-            tabs.TabPages.Remove(tabPorts);
-            tabs.TabPages.Insert(1, tabPorts);   // 顺序：报文 / 飞控串口 / 打印
-
-            Panel pt = new Panel();
-            pt.Dock = DockStyle.Top;
-            pt.Height = 36;
-            tabPorts.Controls.Add(pt);
-
-            Button btnReadPorts = new Button();
-            btnReadPorts.Text = "读取串口配置";
-            btnReadPorts.Location = new Point(8, 6);
-            btnReadPorts.Size = new Size(100, 25);
-            btnReadPorts.Click += delegate { RefreshSerialPorts(); };
-            pt.Controls.Add(btnReadPorts);
-
-            Button btnOnlyPort = new Button();
-            btnOnlyPort.Text = "只看此口";
-            btnOnlyPort.Location = new Point(114, 6);
-            btnOnlyPort.Size = new Size(80, 25);
-            btnOnlyPort.Click += delegate { FilterOnlySelectedPort(); };
-            pt.Controls.Add(btnOnlyPort);
-
-            Button btnAllPorts = new Button();
-            btnAllPorts.Text = "显示全部";
-            btnAllPorts.Location = new Point(200, 6);
-            btnAllPorts.Size = new Size(80, 25);
-            btnAllPorts.Click += delegate
-            {
-                filterPort = -1;
-                filterIds = null;
-                UpdatePortHint();
-            };
-            pt.Controls.Add(btnAllPorts);
-
-            lblPortHint = new Label();
-            lblPortHint.Dock = DockStyle.Bottom;
-            lblPortHint.Height = 46;
-            lblPortHint.ForeColor = Color.FromArgb(90, 90, 90);
-            lblPortHint.Padding = new Padding(8, 4, 8, 4);
-            lblPortHint.Text = "点「读取串口配置」从飞控读取 SERIALn_PROTOCOL / SERIALn_BAUD。";
-            tabPorts.Controls.Add(lblPortHint);
-
-            gridPorts = new DataGridView();
-            gridPorts.Dock = DockStyle.Fill;
-            gridPorts.ReadOnly = true;
-            gridPorts.AllowUserToAddRows = false;
-            gridPorts.AllowUserToDeleteRows = false;
-            gridPorts.AllowUserToResizeRows = false;
-            gridPorts.RowHeadersVisible = false;
-            gridPorts.MultiSelect = false;
-            gridPorts.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-            gridPorts.BackgroundColor = Color.White;
-            gridPorts.GridColor = Color.FromArgb(224, 224, 224);
-            gridPorts.BorderStyle = BorderStyle.None;
-            gridPorts.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei", 9F);
-            gridPorts.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(245, 245, 245);
-            gridPorts.EnableHeadersVisualStyles = false;
-            gridPorts.DefaultCellStyle.Font = new Font("Microsoft YaHei", 9F);
-            gridPorts.DefaultCellStyle.BackColor = Color.White;
-            gridPorts.DefaultCellStyle.ForeColor = Color.Black;
-            gridPorts.DefaultCellStyle.SelectionBackColor = Color.FromArgb(51, 153, 255);
-            gridPorts.DefaultCellStyle.SelectionForeColor = Color.White;
-            gridPorts.RowTemplate.Height = 24;
-            gridPorts.CellDoubleClick += delegate { FilterOnlySelectedPort(); };
-            gridPorts.Columns.Add(PortCol("串口", 150));
-            gridPorts.Columns.Add(PortCol("协议", 190));
-            gridPorts.Columns.Add(PortCol("波特率", 76));
-            DataGridViewTextBoxColumn cEffect = PortCol("能否看到数据 / 对应上报报文", 320);
-            cEffect.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
-            cEffect.MinimumWidth = 240;
-            gridPorts.Columns.Add(cEffect);
-            tabPorts.Controls.Add(gridPorts);
-            gridPorts.BringToFront();
-
             StatusStrip ss = new StatusStrip();
             lblCnt = new ToolStripStatusLabel("收 0 / 发 0");
             lblRate = new ToolStripStatusLabel("0 B/s");
@@ -606,9 +505,7 @@ namespace ZhSerial
             uiTimer.Tick += delegate { Flush(); };
             uiTimer.Start();
 
-            RefreshPorts();
-            SetModeEnabled(false);
-            PrintSys("就绪。「MP 当前连接」看 MP 与飞控的收发；「飞控串口」页看 SERIALn 的协议配置与归属报文；「PC 串口」抓电脑上 COM 口的原始字节。");
+            PrintSys("就绪。监听 MP 当前连接的全部收发报文；「发送」页可直接下发 MAV_CMD 命令与写参数。");
         }
 
         DataGridViewTextBoxColumn AddCol(string text, int width)
@@ -628,51 +525,462 @@ namespace ZhSerial
             c.MinimumWidth = 200;
         }
 
-        static DataGridViewTextBoxColumn PortCol(string text, int width)
+        // ═══════════════════════ 发送页 ═══════════════════════
+
+        // 常用命令：ID + 显示名 + 参数提示
+        static readonly int[] CMD_IDS = new int[]
+        { 400, 22, 21, 20, 176, 178, 183, 179, 300, 511, 512, 246, 241, 16 };
+        static readonly string[] CMD_LABELS = new string[]
         {
-            DataGridViewTextBoxColumn c = new DataGridViewTextBoxColumn();
-            c.HeaderText = text;
-            c.Width = width;
-            c.SortMode = DataGridViewColumnSortMode.NotSortable;
-            return c;
+            "400 · 解锁 / 上锁",
+            "22  · 起飞 TAKEOFF",
+            "21  · 降落 LAND",
+            "20  · 返航 RTL",
+            "176 · 设置模式 DO_SET_MODE",
+            "178 · 修改速度 CHANGE_SPEED",
+            "183 · 设置舵机 DO_SET_SERVO",
+            "179 · 设置 Home",
+            "300 · 开始任务 MISSION_START",
+            "511 · 设置消息频率 SET_MESSAGE_INTERVAL",
+            "512 · 请求消息 REQUEST_MESSAGE",
+            "246 · 重启飞控 REBOOT",
+            "241 · 预检校准 CALIBRATION",
+            "16  · 航点 NAV_WAYPOINT"
+        };
+        static readonly string[] CMD_HINTS = new string[]
+        {
+            "P1 = 1 解锁 / 0 上锁；P2 = 21196 可强制（危险，飞控可能拒绝）",
+            "P7 = 起飞高度（米）；多旋翼需先解锁",
+            "P1 = 0 降落到当前位置",
+            "返航到 Home 点",
+            "P1 = 模式号（Copter：0Stab 1Acro 2AltHold 3Auto 4Guided 5Loiter 6RTL 7Circle 9Land 16PosHold 17Brake）；P2 = 1",
+            "P1 = 0 空速 / 1 地速；P2 = 速度 m/s",
+            "P1 = 舵机输出号；P2 = PWM（1000~2000）",
+            "P1 = 0 表示当前位置设为 Home",
+            "开始执行已上传的任务",
+            "P1 = 消息ID；P2 = 间隔(微秒)，-1 恢复默认 —— 用它提高/降低某类遥测频率",
+            "P1 = 消息ID，请求飞控立刻发一次",
+            "P1 = 1 重启飞控",
+            "P1 = 1 陀螺 / P2 = 1 磁罗盘 / P3 = 1 加速度计（谨慎，飞控会要求静止）",
+            "航点导航，一般由任务自动下发"
+        };
+
+        void BuildSendPage(TabPage page)
+        {
+            GroupBox g1 = new GroupBox();
+            g1.Text = "发送 MAV_CMD 命令（COMMAND_LONG）";
+            g1.Location = new Point(10, 8);
+            g1.Size = new Size(680, 182);
+            g1.ForeColor = Color.Black;
+            page.Controls.Add(g1);
+
+            Label l1 = new Label();
+            l1.Text = "目标 Sysid";
+            l1.AutoSize = true;
+            l1.Location = new Point(12, 26);
+            l1.ForeColor = Color.Black;
+            g1.Controls.Add(l1);
+
+            numSys = new NumericUpDown();
+            numSys.Minimum = 0;
+            numSys.Maximum = 255;
+            numSys.Value = 1;
+            numSys.Location = new Point(86, 24);
+            numSys.Width = 54;
+            g1.Controls.Add(numSys);
+
+            Label lc = new Label();
+            lc.Text = "Compid";
+            lc.AutoSize = true;
+            lc.Location = new Point(150, 26);
+            lc.ForeColor = Color.Black;
+            g1.Controls.Add(lc);
+
+            numComp = new NumericUpDown();
+            numComp.Minimum = 0;
+            numComp.Maximum = 255;
+            numComp.Value = 1;
+            numComp.Location = new Point(200, 24);
+            numComp.Width = 54;
+            g1.Controls.Add(numComp);
+
+            Label l2 = new Label();
+            l2.Text = "命令";
+            l2.AutoSize = true;
+            l2.Location = new Point(266, 26);
+            l2.ForeColor = Color.Black;
+            g1.Controls.Add(l2);
+
+            cmbCmd = new ComboBox();
+            cmbCmd.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbCmd.Location = new Point(300, 24);
+            cmbCmd.Width = 200;
+            cmbCmd.Items.AddRange(CMD_LABELS);
+            cmbCmd.SelectedIndex = 0;
+            cmbCmd.SelectedIndexChanged += delegate { SyncCmdFromCombo(); };
+            g1.Controls.Add(cmbCmd);
+
+            Label l3 = new Label();
+            l3.Text = "ID";
+            l3.AutoSize = true;
+            l3.Location = new Point(510, 26);
+            l3.ForeColor = Color.Black;
+            g1.Controls.Add(l3);
+
+            numCmd = new NumericUpDown();
+            numCmd.Minimum = 0;
+            numCmd.Maximum = 65535;
+            numCmd.Value = 400;
+            numCmd.Location = new Point(534, 24);
+            numCmd.Width = 74;
+            numCmd.ValueChanged += delegate { SyncHint(); };
+            g1.Controls.Add(numCmd);
+
+            for (int i = 0; i < 7; i++)
+            {
+                Label lp = new Label();
+                lp.Text = "P" + (i + 1);
+                lp.AutoSize = true;
+                lp.Location = new Point(12 + (i % 4) * 164, 62 + (i / 4) * 34);
+                lp.ForeColor = Color.Black;
+                g1.Controls.Add(lp);
+
+                NumericUpDown n = new NumericUpDown();
+                n.Minimum = -1000000;
+                n.Maximum = 1000000;
+                n.DecimalPlaces = 3;
+                n.Increment = 1;
+                n.Location = new Point(38 + (i % 4) * 164, 60 + (i / 4) * 34);
+                n.Width = 104;
+                g1.Controls.Add(n);
+                numP[i] = n;
+            }
+
+            lblCmdHint = new Label();
+            lblCmdHint.AutoSize = false;
+            lblCmdHint.Location = new Point(12, 128);
+            lblCmdHint.Size = new Size(600, 18);
+            lblCmdHint.ForeColor = Color.FromArgb(90, 90, 90);
+            lblCmdHint.Text = CMD_HINTS[0];
+            g1.Controls.Add(lblCmdHint);
+
+            Button btnSend = new Button();
+            btnSend.Text = "发送命令";
+            btnSend.Location = new Point(12, 148);
+            btnSend.Size = new Size(96, 26);
+            btnSend.Click += delegate { SendCommand(); };
+            g1.Controls.Add(btnSend);
+
+            Label l4 = new Label();
+            l4.Text = "（发送后可在「报文」页看到发出的包和飞控回的 COMMAND_ACK）";
+            l4.AutoSize = true;
+            l4.Location = new Point(116, 154);
+            l4.ForeColor = Color.Gray;
+            g1.Controls.Add(l4);
+
+            GroupBox g2 = new GroupBox();
+            g2.Text = "写入参数（PARAM_SET）";
+            g2.Location = new Point(10, 198);
+            g2.Size = new Size(680, 74);
+            g2.ForeColor = Color.Black;
+            page.Controls.Add(g2);
+
+            Label lp1 = new Label();
+            lp1.Text = "参数名";
+            lp1.AutoSize = true;
+            lp1.Location = new Point(12, 30);
+            lp1.ForeColor = Color.Black;
+            g2.Controls.Add(lp1);
+
+            txtParamName = new TextBox();
+            txtParamName.Location = new Point(64, 28);
+            txtParamName.Width = 190;
+            txtParamName.BorderStyle = BorderStyle.FixedSingle;
+            txtParamName.CharacterCasing = CharacterCasing.Upper;
+            g2.Controls.Add(txtParamName);
+
+            Label lp2 = new Label();
+            lp2.Text = "值";
+            lp2.AutoSize = true;
+            lp2.Location = new Point(266, 30);
+            lp2.ForeColor = Color.Black;
+            g2.Controls.Add(lp2);
+
+            numParamValue = new NumericUpDown();
+            numParamValue.Minimum = -1000000;
+            numParamValue.Maximum = 1000000;
+            numParamValue.DecimalPlaces = 4;
+            numParamValue.Location = new Point(288, 28);
+            numParamValue.Width = 110;
+            g2.Controls.Add(numParamValue);
+
+            Button btnWrite = new Button();
+            btnWrite.Text = "写入";
+            btnWrite.Location = new Point(410, 26);
+            btnWrite.Size = new Size(70, 26);
+            btnWrite.Click += delegate { WriteParam(); };
+            g2.Controls.Add(btnWrite);
+
+            Label lp3 = new Label();
+            lp3.Text = "例：FLTMODE1=0 或 SERVO1_FUNCTION=70（写前请确认参数名）";
+            lp3.AutoSize = true;
+            lp3.Location = new Point(492, 30);
+            lp3.ForeColor = Color.Gray;
+            g2.Controls.Add(lp3);
+
+            lblSent = new Label();
+            lblSent.AutoSize = false;
+            lblSent.Location = new Point(10, 282);
+            lblSent.Size = new Size(680, 40);
+            lblSent.ForeColor = Color.FromArgb(0, 110, 0);
+            lblSent.Text = "尚未发送。";
+            page.Controls.Add(lblSent);
         }
 
-        void SetModeEnabled(bool portMode)
+        void SyncCmdFromCombo()
         {
-            cmbPort.Enabled = portMode;
-            cmbBaud.Enabled = portMode;
-            btnOpen.Enabled = portMode;
-            btnRefresh.Enabled = portMode;
-            btnScan.Enabled = portMode;
+            int idx = cmbCmd.SelectedIndex;
+            if (idx < 0 || idx >= CMD_IDS.Length) return;
+            try { numCmd.Value = CMD_IDS[idx]; } catch { }
+            SyncHint();
         }
 
-        // ═══════════════════════ 模式切换 ═══════════════════════
-
-        void ModeChanged(object sender, EventArgs e)
+        void SyncHint()
         {
-            if (rbMp == null || rbPort == null) return;
-            bool portMode = rbPort.Checked;
-            SetModeEnabled(portMode);
-            if (portMode)
+            if (lblCmdHint == null || lblCmdHint.IsDisposed) return;
+            int id = (int)numCmd.Value;
+            string hint = "自定义命令 ID：" + id + "（参数含义请查 MAV_CMD 表）";
+            for (int i = 0; i < CMD_IDS.Length; i++)
+                if (CMD_IDS[i] == id) { hint = CMD_HINTS[i]; break; }
+            lblCmdHint.Text = hint;
+        }
+
+        bool EnsureConnected()
+        {
+            try
             {
-                DetachMp();
-                SetState("PC 串口模式：监听电脑上的 COM 口（直连/旁路），确认后点「打开」");
-                PrintSys("切换到 PC 串口模式（监听电脑上的 COM 口）");
+                if (MainV2.comPort != null && MainV2.comPort.BaseStream != null && MainV2.comPort.BaseStream.IsOpen)
+                    return true;
             }
-            else
+            catch { }
+            MessageBox.Show(fm, "MP 还没有连接飞控。\n请先在 MP 里连接，再发送指令。",
+                "未连接", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        void SendCommand()
+        {
+            if (!EnsureConnected()) return;
+            uint sysid = (uint)numSys.Value;
+            byte compid = (byte)numComp.Value;
+            int cmdId = (int)numCmd.Value;
+            float[] p = new float[7];
+            for (int i = 0; i < 7; i++) p[i] = (float)numP[i].Value;
+
+            string arg = "";
+            for (int i = 0; i < 7; i++) arg += (i > 0 ? " " : "") + p[i].ToString("0.###");
+            PrintSys("→ 发送 COMMAND_LONG cmd=" + cmdId + "  " + arg);
+            lblSent.ForeColor = Color.Gray;
+            lblSent.Text = "正在发送 cmd=" + cmdId + " …";
+
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                ClosePort();
-                AttachMp();
-                SetState("MP 连接模式");
-                PrintSys("切换到 MP 连接模式");
+                bool ok = false;
+                string err = "";
+                try
+                {
+                    ok = MainV2.comPort.doCommand(sysid, compid, (MAVLink.MAV_CMD)cmdId,
+                        p[0], p[1], p[2], p[3], p[4], p[5], p[6], false);
+                }
+                catch (Exception ex) { err = ex.Message; }
+
+                string msg = ok
+                    ? "已发送 cmd=" + cmdId + "（" + DateTime.Now.ToString("HH:mm:ss") + "）"
+                    : "发送失败 cmd=" + cmdId + (err.Length > 0 ? "：" + err : "");
+                bool okk = ok;
+                UiPost(delegate
+                {
+                    lblSent.ForeColor = okk ? Color.FromArgb(0, 110, 0) : Color.FromArgb(190, 30, 30);
+                    lblSent.Text = msg;
+                    PrintSys(msg);
+                });
+            });
+        }
+
+        void WriteParam()
+        {
+            if (!EnsureConnected()) return;
+            string name = txtParamName.Text == null ? "" : txtParamName.Text.Trim();
+            if (name.Length == 0)
+            {
+                MessageBox.Show(fm, "请先填参数名（例如 FLTMODE1）", "参数名",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
             }
+            uint sysid = (uint)numSys.Value;
+            byte compid = (byte)numComp.Value;
+            double val = (double)numParamValue.Value;
+
+            PrintSys("→ 写入参数 " + name + " = " + val);
+            lblSent.ForeColor = Color.Gray;
+            lblSent.Text = "正在写入 " + name + " …";
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool ok = false;
+                string err = "";
+                try { ok = MainV2.comPort.setParam(sysid, compid, name, val, false); }
+                catch (Exception ex) { err = ex.Message; }
+
+                string msg = ok
+                    ? "参数已写入 " + name + " = " + val
+                    : "参数写入失败 " + name + (err.Length > 0 ? "：" + err : "");
+                bool okk = ok;
+                UiPost(delegate
+                {
+                    lblSent.ForeColor = okk ? Color.FromArgb(0, 110, 0) : Color.FromArgb(190, 30, 30);
+                    lblSent.Text = msg;
+                    PrintSys(msg);
+                });
+            });
+        }
+
+        void UiPost(Action a)
+        {
+            try
+            {
+                if (fm != null && !fm.IsDisposed)
+                    fm.BeginInvoke(a);
+            }
+            catch { }
+        }
+
+        // ═══════════════════════ 消息类型过滤 ═══════════════════════
+
+        void OnTypeChanged()
+        {
+            int idx = cmbMsgType.SelectedIndex;
+            if (idx <= 0)
+            {
+                selTypes = null;
+                SetState("消息类型：全部");
+                return;
+            }
+            TypeItem it = cmbMsgType.Items[idx] as TypeItem;
+            if (it == null) { selTypes = null; return; }
+            HashSet<uint> s = new HashSet<uint>();
+            s.Add(it.Id);
+            selTypes = s;
+            SetState("消息类型：" + it.Name);
+        }
+
+        void PickTypes()
+        {
+            List<TypeItem> all = new List<TypeItem>();
+            if (cmbMsgType != null)
+            {
+                for (int i = 0; i < cmbMsgType.Items.Count; i++)
+                {
+                    TypeItem ti = cmbMsgType.Items[i] as TypeItem;
+                    if (ti != null) all.Add(ti);
+                }
+            }
+            if (all.Count == 0)
+            {
+                MessageBox.Show(fm, "还没有收到任何报文，等一下再来选。", "消息类型",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            all.Sort(delegate (TypeItem a, TypeItem b) { return string.Compare(a.Name, b.Name); });
+
+            Form f = new Form();
+            f.Text = "选择要显示的消息类型（可多选）";
+            f.Size = new Size(360, 520);
+            f.MinimumSize = new Size(300, 360);
+            f.StartPosition = FormStartPosition.CenterParent;
+            f.MinimizeBox = false;
+            f.MaximizeBox = false;
+            f.ShowIcon = false;
+
+            Panel pnlBottom = new Panel();
+            pnlBottom.Dock = DockStyle.Bottom;
+            pnlBottom.Height = 42;
+            f.Controls.Add(pnlBottom);
+
+            Button bAll = new Button();
+            bAll.Text = "全选";
+            bAll.Location = new Point(8, 8);
+            bAll.Size = new Size(64, 26);
+            pnlBottom.Controls.Add(bAll);
+
+            Button bNone = new Button();
+            bNone.Text = "全不选";
+            bNone.Location = new Point(78, 8);
+            bNone.Size = new Size(72, 26);
+            pnlBottom.Controls.Add(bNone);
+
+            Button bOk = new Button();
+            bOk.Text = "确定";
+            bOk.Location = new Point(190, 8);
+            bOk.Size = new Size(70, 26);
+            bOk.DialogResult = DialogResult.OK;
+            pnlBottom.Controls.Add(bOk);
+
+            Button bCancel = new Button();
+            bCancel.Text = "取消";
+            bCancel.Location = new Point(266, 8);
+            bCancel.Size = new Size(70, 26);
+            bCancel.DialogResult = DialogResult.Cancel;
+            pnlBottom.Controls.Add(bCancel);
+
+            CheckedListBox clb = new CheckedListBox();
+            clb.Dock = DockStyle.Fill;
+            clb.CheckOnClick = true;
+            clb.Font = new Font("Consolas", 9F);
+            for (int i = 0; i < all.Count; i++)
+            {
+                bool sel = selTypes != null && selTypes.Contains(all[i].Id);
+                clb.Items.Add(all[i], sel);
+            }
+            f.Controls.Add(clb);
+            clb.BringToFront();
+
+            bAll.Click += delegate
+            {
+                for (int i = 0; i < clb.Items.Count; i++) clb.SetItemChecked(i, true);
+            };
+            bNone.Click += delegate
+            {
+                for (int i = 0; i < clb.Items.Count; i++) clb.SetItemChecked(i, false);
+            };
+
+            f.AcceptButton = bOk;
+            f.CancelButton = bCancel;
+
+            if (f.ShowDialog(fm) != DialogResult.OK) return;
+
+            HashSet<uint> picked = new HashSet<uint>();
+            for (int i = 0; i < clb.Items.Count; i++)
+            {
+                if (!clb.GetItemChecked(i)) continue;
+                TypeItem ti = clb.Items[i] as TypeItem;
+                if (ti != null) picked.Add(ti.Id);
+            }
+            if (picked.Count == 0)
+            {
+                selTypes = null;
+                try { cmbMsgType.SelectedIndex = 0; } catch { }
+                SetState("消息类型：全部");
+                return;
+            }
+            selTypes = picked;
+            SetState("消息类型：已选 " + picked.Count + " 种");
         }
 
         // ═══════════════════════ MP 连接透听 ═══════════════════════
 
         void AttachMp()
         {
-            if (rbPort != null && rbPort.Checked) return;
             try
             {
                 if (MainV2.comPort == null) return;
@@ -713,12 +1021,31 @@ namespace ZhSerial
                 r.Len = r.Raw != null ? r.Raw.Length : 0;
                 r.Payload = PayloadLen(r.Raw);
                 r.Content = BuildContent(r);
-                Count(r);
-                // 「只看某个飞控串口」过滤：按协议的报文集合筛
-                if (filterPort >= 0 && filterIds != null && !filterIds.Contains(r.MsgId)) return;
-                Enqueue(r);
+
+                NoteType(r.MsgId, r.Name);
+
+                if (r.Len > 0) Interlocked.Add(ref cBytes, r.Len);
+                if (r.Sent) Interlocked.Increment(ref cTx); else Interlocked.Increment(ref cRx);
+
+                if (paused) return;
+                HashSet<uint> types = selTypes;
+                if (types != null && !types.Contains(r.MsgId)) return;
+                lock (pending)
+                {
+                    if (pending.Count >= MaxPending) { Interlocked.Increment(ref cDrop); return; }
+                    pending.Add(r);
+                }
             }
             catch { }
+        }
+
+        void NoteType(uint id, string name)
+        {
+            lock (typeLock)
+            {
+                if (!typeSeen.Add(id)) return;
+                typePending.Add(new TypeItem(id, name));
+            }
         }
 
         static int PayloadLen(byte[] b)
@@ -783,11 +1110,8 @@ namespace ZhSerial
         static string BuildContent(RowInfo r)
         {
             object d = r.Data;
-            if (d == null)
-            {
-                if (r.IsAscii) return r.Content;
-                return HexShort(r.Raw, 24);
-            }
+            if (d == null) return HexShort(r.Raw, 24);
+
             FieldInfo[] fs = GetFields(d.GetType());
             object sev = null;
             string text = null;
@@ -800,10 +1124,11 @@ namespace ZhSerial
             if (text != null && text.Trim().Length > 0)
             {
                 string s = text.Trim();
-                int si = SysIdToInt(sev, -1);
+                int si = ToIntVal(sev, -1);
                 if (si >= 0) return "[" + SevName(si) + "] " + s;
                 return s;
             }
+
             StringBuilder sb = new StringBuilder();
             int used = 0;
             for (int i = 0; i < fs.Length && used < 5; i++)
@@ -823,7 +1148,7 @@ namespace ZhSerial
             return outp;
         }
 
-        static int SysIdToInt(object v, int dflt)
+        static int ToIntVal(object v, int dflt)
         {
             if (v == null) return dflt;
             try { return Convert.ToInt32(v); } catch { return dflt; }
@@ -894,805 +1219,17 @@ namespace ZhSerial
             return sb.ToString();
         }
 
-        // ═══════════════════════ 飞控串口（自动识别） ═══════════════════════
-
-        // 下拉项：COM3   ★ 飞控（MP 正在使用）
-        class PortItem
-        {
-            public string Name = "";
-            public string Note = "";
-            public override string ToString()
-            {
-                return Note.Length == 0 ? Name : Name + "   " + Note;
-            }
-        }
-
-        string SelectedPortName()
-        {
-            if (cmbPort == null) return "";
-            PortItem it = cmbPort.SelectedItem as PortItem;
-            if (it != null) return it.Name;
-            return cmbPort.Text == null ? "" : cmbPort.Text.Trim();
-        }
-
-        // MP 当前正打开着的串口
-        static string LiveMpPort()
-        {
-            try
-            {
-                if (MainV2.comPort != null && MainV2.comPort.BaseStream != null && MainV2.comPort.BaseStream.IsOpen)
-                    return MainV2.comPort.BaseStream.PortName;
-            }
-            catch { }
-            return "";
-        }
-
-        // MP 配置里记着的串口（上次连接用的）
-        static string CfgMpPort()
-        {
-            try
-            {
-                string s = MissionPlanner.Utilities.Settings.Instance["comport"];
-                if (s == null) return "";
-                return s.Trim();
-            }
-            catch { }
-            return "";
-        }
-
-        // 从注册表 SERIALCOMM 判断哪些是 USB 转串口（飞控/数传基本都是 USB 虚拟串口）
-        static HashSet<string> UsbSerialPorts()
-        {
-            HashSet<string> set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            try
-            {
-                using (Microsoft.Win32.RegistryKey k =
-                    Microsoft.Win32.Registry.LocalMachine.OpenSubKey("HARDWARE\\DEVICEMAP\\SERIALCOMM"))
-                {
-                    if (k != null)
-                    {
-                        string[] names = k.GetValueNames();
-                        for (int i = 0; i < names.Length; i++)
-                        {
-                            string dev = names[i] == null ? "" : names[i].ToUpperInvariant();
-                            if (dev.IndexOf("USBSER") < 0 && dev.IndexOf("VCP") < 0 && dev.IndexOf("USB") < 0) continue;
-                            string port = Convert.ToString(k.GetValue(names[i]));
-                            if (!string.IsNullOrEmpty(port)) set.Add(port.Trim());
-                        }
-                    }
-                }
-            }
-            catch { }
-            return set;
-        }
-
-        static int PortNumber(string name)
-        {
-            if (name == null) return 0;
-            StringBuilder d = new StringBuilder();
-            for (int i = 0; i < name.Length; i++)
-                if (name[i] >= '0' && name[i] <= '9') d.Append(name[i]);
-            return ToInt(d.ToString(), 0);
-        }
-
-        // 列出串口：飞控相关排前面并打星，其余按串口号排
-        void RefreshPorts()
-        {
-            if (cmbPort == null) return;
-            string keep = SelectedPortName();
-            string[] names = new string[0];
-            try { names = System.IO.Ports.SerialPort.GetPortNames(); }
-            catch (Exception ex) { SetState("枚举串口失败：" + ex.Message); return; }
-
-            string live = LiveMpPort();
-            string cfg = CfgMpPort();
-            HashSet<string> usb = UsbSerialPorts();
-
-            List<PortItem> fc = new List<PortItem>();
-            List<PortItem> usbList = new List<PortItem>();
-            List<PortItem> other = new List<PortItem>();
-
-            for (int i = 0; i < names.Length; i++)
-            {
-                PortItem it = new PortItem();
-                it.Name = names[i];
-                if (sp != null && string.Compare(names[i], sp.PortName, true) == 0)
-                {
-                    it.Note = "● 正在监听";
-                    fc.Add(it);
-                }
-                else if (live.Length > 0 && string.Compare(names[i], live, true) == 0)
-                {
-                    it.Note = "★ 飞控（MP 正在使用）";
-                    fc.Add(it);
-                }
-                else if (cfg.Length > 0 && string.Compare(names[i], cfg, true) == 0)
-                {
-                    it.Note = "★ 飞控（MP 上次连接）";
-                    fc.Add(it);
-                }
-                else if (usb.Contains(names[i]))
-                {
-                    it.Note = "USB 串口";
-                    usbList.Add(it);
-                }
-                else other.Add(it);
-            }
-
-            SortByPortNo(fc);
-            SortByPortNo(usbList);
-            SortByPortNo(other);
-
-            cmbPort.BeginUpdate();
-            cmbPort.Items.Clear();
-            for (int i = 0; i < fc.Count; i++) cmbPort.Items.Add(fc[i]);
-            for (int i = 0; i < usbList.Count; i++) cmbPort.Items.Add(usbList[i]);
-            for (int i = 0; i < other.Count; i++) cmbPort.Items.Add(other[i]);
-            cmbPort.EndUpdate();
-
-            // 默认选中：上次选的 → MP 正在用的 → MP 配置的 → 第一个
-            string want = keep;
-            if (want.Length == 0) want = live;
-            if (want.Length == 0) want = cfg;
-            if (want.Length == 0 && cmbPort.Items.Count > 0) want = ((PortItem)cmbPort.Items[0]).Name;
-            SelectPort(want);
-        }
-
-        static void SortByPortNo(List<PortItem> list)
-        {
-            for (int i = 1; i < list.Count; i++)
-            {
-                PortItem cur = list[i];
-                int j = i - 1;
-                while (j >= 0 && PortNumber(list[j].Name) > PortNumber(cur.Name))
-                {
-                    list[j + 1] = list[j];
-                    j--;
-                }
-                list[j + 1] = cur;
-            }
-        }
-
-        void SelectPort(string name)
-        {
-            if (cmbPort == null || name == null) return;
-            for (int i = 0; i < cmbPort.Items.Count; i++)
-            {
-                PortItem it = cmbPort.Items[i] as PortItem;
-                if (it != null && string.Compare(it.Name, name, true) == 0)
-                {
-                    cmbPort.SelectedIndex = i;
-                    return;
-                }
-            }
-            if (cmbPort.Items.Count > 0) cmbPort.SelectedIndex = 0;
-        }
-
-        void OpenPort()
-        {
-            if (sp != null) return;
-            string name = SelectedPortName();
-            if (name.Length == 0) { SetState("请先选择飞控对应的串口"); return; }
-            int baud = ToInt(cmbBaud.Text, 57600);
-            if (!TryOpen(name, baud))
-            {
-                // 被 MP 占着：问一次要不要接管
-                if (!IsPortBusy) return;
-                string live = LiveMpPort();
-                string tip = "串口 " + name + " 正被 Mission Planner 占用。\r\n\r\n"
-                    + "是否断开 MP 与飞控的连接，把该串口交给监听工具？\r\n"
-                    + "（之后在 MP 里点「连接」可恢复）";
-                if (live.Length > 0 && string.Compare(live, name, true) != 0)
-                    tip = "串口 " + name + " 正被其它程序占用。\r\n\r\n请先关闭占用它的程序后重试。";
-                if (live.Length > 0 && string.Compare(live, name, true) == 0)
-                {
-                    if (MessageBox.Show(fm, tip, "串口被占用", MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Warning) != DialogResult.Yes)
-                    {
-                        SetState("已取消：串口 " + name + " 仍被 MP 占用");
-                        return;
-                    }
-                    try { DetachMp(); } catch { }
-                    try { MainV2.comPort.Close(); } catch { }
-                    Thread.Sleep(400);
-                    if (!TryOpen(name, baud))
-                    {
-                        SetState("接管失败：" + LastOpenError);
-                        PrintSys("接管 " + name + " 失败：" + LastOpenError);
-                        return;
-                    }
-                }
-                else
-                {
-                    MessageBox.Show(fm, tip, "串口被占用", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-            }
-            lock (rbuf) rbuf.Clear();
-            running = true;
-            th = new Thread(ReadLoop);
-            th.IsBackground = true;
-            th.Name = "zh-serial-read";
-            th.Start();
-            try { btnOpen.Text = "关闭"; } catch { }
-            SetState("已打开 " + name + " @ " + baud);
-            PrintSys("打开串口 " + name + " @ " + baud);
-            if (rbPort != null) RefreshPorts();
-        }
-
-        bool IsPortBusy;
-        string LastOpenError = "";
-
-        bool TryOpen(string name, int baud)
-        {
-            IsPortBusy = false;
-            LastOpenError = "";
-            try
-            {
-                System.IO.Ports.SerialPort p = new System.IO.Ports.SerialPort();
-                p.PortName = name;
-                p.BaudRate = baud;
-                p.Parity = System.IO.Ports.Parity.None;
-                p.DataBits = 8;
-                p.StopBits = System.IO.Ports.StopBits.One;
-                p.ReadTimeout = 500;
-                p.WriteTimeout = 500;
-                try { p.ReadBufferSize = 65536; } catch { }
-                p.Open();
-                sp = p;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                sp = null;
-                LastOpenError = ex.Message;
-                // 拒绝访问 / 已被占用
-                string m = ex.Message == null ? "" : ex.Message.ToUpperInvariant();
-                if (ex is UnauthorizedAccessException || m.IndexOf("ACCESS") >= 0 || m.IndexOf("拒绝") >= 0
-                    || m.IndexOf("BUSY") >= 0 || m.IndexOf("占用") >= 0)
-                    IsPortBusy = true;
-                SetState("打开 " + name + " 失败：" + ex.Message);
-                PrintSys("打开 " + name + " 失败：" + ex.Message);
-                return false;
-            }
-        }
-
-        void ClosePort()
-        {
-            running = false;
-            System.IO.Ports.SerialPort p = sp;
-            sp = null;
-            try { if (p != null && p.IsOpen) p.Close(); } catch { }
-            try { if (p != null) p.Dispose(); } catch { }
-            try { btnOpen.Text = "打开"; } catch { }
-            lock (rbuf) rbuf.Clear();
-            if (p != null)
-            {
-                SetState("串口已关闭");
-                PrintSys("关闭串口");
-            }
-        }
-
-        void ReadLoop()
-        {
-            byte[] tmp = new byte[8192];
-            while (running)
-            {
-                System.IO.Ports.SerialPort p = sp;
-                if (p == null) break;
-                try
-                {
-                    int avail = p.BytesToRead;
-                    if (avail <= 0) { Thread.Sleep(20); continue; }
-                    int want = avail;
-                    if (want > tmp.Length) want = tmp.Length;
-                    int got = p.Read(tmp, 0, want);
-                    if (got > 0)
-                    {
-                        lock (rbuf)
-                        {
-                            for (int i = 0; i < got; i++) rbuf.Add(tmp[i]);
-                            if (rbuf.Count > 262144) rbuf.RemoveRange(0, rbuf.Count - 262144);
-                        }
-                        Drain();
-                    }
-                }
-                catch (TimeoutException) { }
-                catch (Exception ex)
-                {
-                    if (!running) break;      // 主动关闭导致的中断，不报错
-                    running = false;
-                    string msg = ex.Message;
-                    try
-                    {
-                        if (fm != null && !fm.IsDisposed)
-                            fm.BeginInvoke((Action)delegate
-                            {
-                                SetState("串口读取中断：" + msg);
-                                PrintSys("串口读取中断：" + msg);
-                                ClosePort();
-                            });
-                    }
-                    catch { }
-                    break;
-                }
-            }
-        }
-
-        // 把缓冲区里的字节拆成：MAVLink v1/v2 帧 + ASCII 文本行
-        void Drain()
-        {
-            List<RowInfo> rows = new List<RowInfo>();
-            lock (rbuf)
-            {
-                int i = 0;
-                int count = rbuf.Count;
-                while (i < count)
-                {
-                    byte b = rbuf[i];
-                    if (b == 0xFE)
-                    {
-                        if (count - i < 2) break;
-                        int len = rbuf[i + 1];
-                        int total = 6 + len + 2;
-                        if (count - i < total) break;
-                        rows.Add(MakeFrameRow(i, total, false));
-                        i += total;
-                        continue;
-                    }
-                    if (b == 0xFD)
-                    {
-                        if (count - i < 10) break;
-                        int len = rbuf[i + 1];
-                        int incompat = rbuf[i + 2];
-                        int total = 10 + len + 2 + (((incompat & 0x01) != 0) ? 13 : 0);
-                        if (count - i < total) break;
-                        rows.Add(MakeFrameRow(i, total, true));
-                        i += total;
-                        continue;
-                    }
-                    int j = i + 1;
-                    while (j < count && rbuf[j] != 0xFE && rbuf[j] != 0xFD && (j - i) < 512) j++;
-                    string txt = AsciiOf(rbuf, i, j - i);
-                    if (txt != null && txt.Length > 0)
-                    {
-                        RowInfo r = new RowInfo();
-                        r.Time = DateTime.Now;
-                        r.IsAscii = true;
-                        r.Name = "TEXT";
-                        r.MsgId = 0xFFFFFFFF;
-                        r.Content = txt;
-                        byte[] raw = new byte[j - i];
-                        for (int k = 0; k < raw.Length; k++) raw[k] = rbuf[i + k];
-                        r.Raw = raw;
-                        r.Len = raw.Length;
-                        rows.Add(r);
-                    }
-                    i = j;
-                }
-                if (i > 0) rbuf.RemoveRange(0, i);
-            }
-            for (int k = 0; k < rows.Count; k++)
-            {
-                Count(rows[k]);
-                Enqueue(rows[k]);
-            }
-        }
-
-        static string AsciiOf(List<byte> buf, int start, int len)
-        {
-            if (len <= 0) return null;
-            StringBuilder sb = new StringBuilder();
-            int printable = 0;
-            for (int i = 0; i < len && sb.Length < 512; i++)
-            {
-                byte c = buf[start + i];
-                if (c == 13) continue;
-                if (c == 10) { sb.Append(' '); continue; }
-                if (c >= 32 && c < 127) { sb.Append((char)c); printable++; }
-                else if (c == 9) sb.Append(' ');
-                else { sb.Append('·'); }
-            }
-            if (printable < 2) return null;
-            string s = sb.ToString().Trim();
-            if (s.Length < 2) return null;
-            return s;
-        }
-
-        RowInfo MakeFrameRow(int off, int total, bool v2)
-        {
-            RowInfo r = new RowInfo();
-            r.Time = DateTime.Now;
-            r.Len = total;
-            if (v2)
-            {
-                r.Seq = rbuf[off + 4];
-                r.SysId = rbuf[off + 5];
-                r.CompId = rbuf[off + 6];
-                r.MsgId = (uint)(rbuf[off + 7] | (rbuf[off + 8] << 8) | (rbuf[off + 9] << 16));
-                r.Payload = rbuf[off + 1];
-            }
-            else
-            {
-                r.Seq = rbuf[off + 2];
-                r.SysId = rbuf[off + 3];
-                r.CompId = rbuf[off + 4];
-                r.MsgId = rbuf[off + 5];
-                r.Payload = rbuf[off + 1];
-            }
-            byte[] raw = new byte[total];
-            for (int i = 0; i < total; i++) raw[i] = rbuf[off + i];
-            r.Raw = raw;
-            r.Name = MsgName(r.MsgId);
-            r.Content = "payload " + r.Payload + "B  " + HexShort(raw, 16);
-            return r;
-        }
-
-        // 自动扫描波特率：逐个尝试，收到合法 MAVLink 帧即认为命中
-        void ScanBaud()
-        {
-            if (sp != null) { SetState("请先关闭当前串口再扫描"); return; }
-            string name = SelectedPortName();
-            if (name.Length == 0) { SetState("请先选择飞控对应的串口"); return; }
-            int[] cand = new int[] { 115200, 57600, 921600, 460800, 230400, 38400, 19200, 9600, 1500000, 2000000 };
-            SetState("正在扫描波特率…");
-            StringBuilder cl = new StringBuilder();
-            for (int i = 0; i < cand.Length; i++)
-            {
-                if (i > 0) cl.Append(',');
-                cl.Append(cand[i]);
-            }
-            PrintSys("开始扫描 " + name + " 的波特率：" + cl.ToString());
-            Thread t = new Thread(delegate ()
-            {
-                for (int i = 0; i < cand.Length; i++)
-                {
-                    int baud = cand[i];
-                    if (closing) return;
-                    try
-                    {
-                        if (fm != null && !fm.IsDisposed)
-                            fm.BeginInvoke((Action)delegate { SetState("扫描中… " + baud); });
-                    }
-                    catch { }
-                    bool hit = ProbeBaud(name, baud);
-                    if (hit)
-                    {
-                        try
-                        {
-                            if (fm != null && !fm.IsDisposed)
-                                fm.BeginInvoke((Action)delegate
-                                {
-                                    cmbBaud.Text = baud.ToString();
-                                    SetState("命中波特率 " + baud + "，已打开");
-                                    PrintSys("命中波特率 " + baud);
-                                    OpenPort();
-                                });
-                        }
-                        catch { }
-                        return;
-                    }
-                }
-                try
-                {
-                    if (fm != null && !fm.IsDisposed)
-                        fm.BeginInvoke((Action)delegate
-                        {
-                            SetState("未扫描到 MAVLink 数据（线序/端口是否正确？）");
-                            PrintSys("扫描结束：未发现 MAVLink 帧");
-                        });
-                }
-                catch { }
-            });
-            t.IsBackground = true;
-            t.Name = "zh-serial-scan";
-            t.Start();
-        }
-
-        bool ProbeBaud(string name, int baud)
-        {
-            System.IO.Ports.SerialPort p = null;
-            try
-            {
-                p = new System.IO.Ports.SerialPort(name, baud, System.IO.Ports.Parity.None, 8, System.IO.Ports.StopBits.One);
-                p.ReadTimeout = 300;
-                p.Open();
-                DateTime end = DateTime.Now.AddMilliseconds(1400);
-                byte[] tmp = new byte[4096];
-                List<byte> acc = new List<byte>();
-                while (DateTime.Now < end && acc.Count < 8192)
-                {
-                    try
-                    {
-                        int n = p.BytesToRead;
-                        if (n <= 0) { Thread.Sleep(20); continue; }
-                        if (n > tmp.Length) n = tmp.Length;
-                        int got = p.Read(tmp, 0, n);
-                        for (int i = 0; i < got; i++) acc.Add(tmp[i]);
-                    }
-                    catch (TimeoutException) { }
-                }
-                // 找合法帧头 + 合理长度
-                for (int i = 0; i + 2 < acc.Count; i++)
-                {
-                    if (acc[i] == 0xFD && acc[i + 2] <= 4) return true;
-                    if (acc[i] == 0xFE && acc[i + 1] > 0 && acc[i + 1] < 255) return true;
-                }
-                return false;
-            }
-            catch { return false; }
-            finally
-            {
-                try { if (p != null && p.IsOpen) p.Close(); } catch { }
-                try { if (p != null) p.Dispose(); } catch { }
-            }
-        }
-
-        // ═══════════════════════ 飞控串口 SERIALn（协议 + 报文归属） ═══════════════════════
-
-        // 参数下载完成后自动读一次串口配置（每 5 秒试一次，读到就不再试）
-        void AutoPorts()
-        {
-            if (gridPorts == null || gridPorts.IsDisposed) return;
-            if (gridPorts.Rows.Count > 0) return;
-            portAutoTick++;
-            if (portAutoTick % 5 != 0) return;
-            RefreshSerialPorts();
-        }
-
-        static bool TryParam(string name, out double v)
-        {
-            v = 0;
-            try
-            {
-                if (MainV2.comPort == null || MainV2.comPort.MAV == null) return false;
-                var prms = MainV2.comPort.MAV.param;      // MAVLinkParamList
-                if (prms == null || !prms.ContainsKey(name)) return false;
-                v = (float)prms[name];
-                return true;
-            }
-            catch { return false; }
-        }
-
-        static Dictionary<int, string> protoNames;
-
-        static Dictionary<int, string> ProtoNames()
-        {
-            if (protoNames != null) return protoNames;
-            Dictionary<int, string> d = new Dictionary<int, string>();
-            d[-1] = "未配置";
-            d[1] = "MAVLink1";
-            d[2] = "MAVLink2";
-            d[3] = "FrSky D";
-            d[4] = "FrSky SPort";
-            d[5] = "GPS";
-            d[7] = "Alexmos 云台";
-            d[8] = "云台";
-            d[9] = "测距雷达";
-            d[10] = "FrSky SPort 透传";
-            d[11] = "Lidar360";
-            d[13] = "信标";
-            d[14] = "Volz 舵机";
-            d[15] = "SBus 舵机";
-            d[16] = "ESC 电调遥测";
-            d[17] = "Devo 遥测";
-            d[18] = "光流";
-            d[19] = "Robotis 舵机";
-            d[20] = "NMEA 输出";
-            d[21] = "风向标";
-            d[22] = "SLCAN(DroneCAN)";
-            d[23] = "RCIN";
-            d[24] = "EFI（发动机）";
-            d[25] = "LTM";
-            d[26] = "RunCam";
-            d[27] = "HoTT 遥测";
-            d[28] = "脚本 Scripting";
-            d[29] = "Crossfire VTX";
-            d[30] = "发电机";
-            d[31] = "绞车";
-            d[32] = "MSP";
-            d[33] = "DJI FPV";
-            d[34] = "空速计";
-            d[35] = "ADS-B";
-            d[36] = "AHRS";
-            d[37] = "SmartAudio";
-            d[38] = "FETtec OneWire";
-            d[39] = "Torqeedo";
-            d[40] = "AIS";
-            d[41] = "CoDevESC";
-            d[42] = "DisplayPort";
-            d[43] = "MAVLink 低带宽";
-            d[44] = "IRC Tramp";
-            d[45] = "DDS XRCE";
-            d[46] = "IMU 数据";
-            d[48] = "PPP";
-            d[49] = "i-BUS 遥测";
-            d[50] = "IOMCU";
-            protoNames = d;
-            return d;
-        }
-
-        static string ProtoName(int p)
-        {
-            string n;
-            if (ProtoNames().TryGetValue(p, out n)) return n;
-            if (p < 0) return "未配置";
-            return "自定义（" + p + "）";
-        }
-
-        // 协议 → 该口数据会被固件封装成哪些 MAVLink 报文（用数字 ID，稳定且不依赖枚举名）
-        static HashSet<uint> MsgIdsForProto(int p)
-        {
-            HashSet<uint> s = new HashSet<uint>();
-            switch (p)
-            {
-                case 24: s.Add(225); break;                        // EFI_STATUS
-                case 5: s.Add(24); s.Add(124); s.Add(233); break;  // GPS_RAW_INT / GPS2_RAW / GPS_RTCM_DATA
-                case 16: s.Add(291); break;                        // ESC_STATUS
-                case 23: s.Add(65); break;                         // RC_CHANNELS
-                case 9: s.Add(132); break;                         // DISTANCE_SENSOR
-                case 35: s.Add(246); break;                        // ADSB_VEHICLE
-                case 30: s.Add(373); break;                        // GENERATOR_STATUS
-                case 31: s.Add(9005); break;                       // WINCH_STATUS
-                case 28: s.Add(251); s.Add(253); break;            // NAMED_VALUE_FLOAT / STATUSTEXT
-                default: break;                                    // 空集合 = 固件不上报
-            }
-            return s;
-        }
-
-        static string PortEffect(int p)
-        {
-            if (p < 0) return "未配置：固件不会上报该口数据，只能靠透传或硬件旁路抓原始字节";
-            if (p == 1 || p == 2 || p == 43)
-                return "MAVLink 链路：MP 若正走这个口，「报文」页就是它的全部收发";
-            HashSet<uint> s = MsgIdsForProto(p);
-            if (s.Count == 0)
-                return "固件不上报该口数据（" + ProtoName(p) + "），只能靠透传或硬件旁路抓原始字节";
-            StringBuilder sb = new StringBuilder("经 MAVLink 上报：");
-            int i = 0;
-            foreach (uint id in s)
-            {
-                if (i++ > 0) sb.Append("、");
-                sb.Append(MsgName(id));
-            }
-            return sb.ToString();
-        }
-
-        void RefreshSerialPorts()
-        {
-            if (gridPorts == null || gridPorts.IsDisposed) return;
-            gridPorts.Rows.Clear();
-            portProto.Clear();
-            portBaud.Clear();
-
-            int found = 0;
-            for (int i = 0; i <= 9; i++)
-            {
-                double pv;
-                if (!TryParam("SERIAL" + i + "_PROTOCOL", out pv)) continue;
-                double bv;
-                TryParam("SERIAL" + i + "_BAUD", out bv);
-                int proto = (int)Math.Round(pv);
-                portProto[i] = proto;
-                portBaud[i] = bv;
-
-                int row = gridPorts.Rows.Add();
-                DataGridViewRow r = gridPorts.Rows[row];
-                r.Tag = i;
-                r.Cells[0].Value = "SERIAL" + i + (i == 0 ? "（USB/控制台）" : "");
-                r.Cells[1].Value = ProtoName(proto);
-                r.Cells[2].Value = bv > 0 ? bv.ToString("0") : "-";
-                r.Cells[3].Value = PortEffect(proto);
-                if (i == filterPort) r.DefaultCellStyle.BackColor = Color.FromArgb(232, 244, 255);
-                found++;
-            }
-
-            if (found == 0)
-            {
-                lblPortHint.Text = "未读到 SERIALn_PROTOCOL：请先连接飞控，等参数下载完成后再点「读取串口配置」。";
-                return;
-            }
-            if (gridPorts.Rows.Count > 0 && gridPorts.SelectedRows.Count == 0)
-                gridPorts.Rows[0].Selected = true;
-            UpdatePortHint();
-            SetState("已读取 " + found + " 个飞控串口的协议配置");
-        }
-
-        void FilterOnlySelectedPort()
-        {
-            if (gridPorts == null || gridPorts.SelectedRows.Count == 0)
-            {
-                SetState("请先在表格里选中一个串口");
-                return;
-            }
-            object t = gridPorts.SelectedRows[0].Tag;
-            if (t == null) return;
-            int port = (int)t;
-            int proto;
-            if (!portProto.TryGetValue(port, out proto)) return;
-
-            HashSet<uint> set = MsgIdsForProto(proto);
-            if (proto == 1 || proto == 2 || proto == 43)
-            {
-                filterPort = -1;
-                filterIds = null;
-                MessageBox.Show(fm,
-                    "SERIAL" + port + " 是 MAVLink 链路。\n\n"
-                    + "MP 与飞控之间的全部收发都走这条链路，所以「报文」页看到的就是它；\n"
-                    + "无法从报文里再区分「是哪个口进来的」，因为没有来源标记。",
-                    "MAVLink 口", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                UpdatePortHint();
-                return;
-            }
-            if (set.Count == 0)
-            {
-                MessageBox.Show(fm,
-                    "SERIAL" + port + "（" + ProtoName(proto) + "）没有对应的上报报文。\n\n"
-                    + PortEffect(proto) + "\n\n"
-                    + "原因：飞控板上的 UART 是内部总线，只有固件主动封装成 MAVLink 的数据才能到 MP。\n"
-                    + "未配置/自定义协议的口，要看到原始字节只能：\n"
-                    + "  ① 固件侧透传（SERIAL_PASS1/PASS2，会把该口桥到某个物理串口）\n"
-                    + "  ② 硬件旁路（把该 UART 的 TX 接到 USB-TTL，用「PC 串口」模式抓）",
-                    "该口没有可看的报文", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-
-            filterPort = port;
-            filterIds = set;
-            if (tabs.TabPages.Count > 0) tabs.SelectedTab = tabs.TabPages[0];
-            UpdatePortHint();
-            SetState("过滤：只看 SERIAL" + port + "（" + ProtoName(proto) + "）相关报文");
-        }
-
-        void UpdatePortHint()
-        {
-            if (lblPortHint == null || lblPortHint.IsDisposed) return;
-            if (filterPort < 0 || filterIds == null)
-            {
-                lblPortHint.Text = "当前显示全部报文。选中某个 SERIALn → 点「只看此口」，即可只看该口对应的上报报文。\r\n"
-                    + "注意：飞控 UART 是内部总线，只有固件主动封装成 MAVLink 的数据才能到 MP；"
-                    + "未配置/自定义协议的口需固件透传或硬件旁路才能看到原始字节。";
-                return;
-            }
-            int proto;
-            portProto.TryGetValue(filterPort, out proto);
-            lblPortHint.Text = "当前只显示 SERIAL" + filterPort + "（" + ProtoName(proto) + "）对应的上报报文。\r\n"
-                + "点「显示全部」可取消过滤。";
-        }
-
-        // ═══════════════════════ 统计 / 入队 / 上屏 ═══════════════════════
-
-        void Count(RowInfo r)
-        {
-            if (r.Len > 0) Interlocked.Add(ref cBytes, r.Len);
-            if (r.Sent) Interlocked.Increment(ref cTx); else Interlocked.Increment(ref cRx);
-            if (r.IsAscii) Interlocked.Increment(ref cAscii);
-            if (r.Raw == null) Interlocked.Increment(ref cErr);
-        }
-
-        void Enqueue(RowInfo r)
-        {
-            if (paused) return;
-            if (!Pass(r)) return;
-            lock (pending)
-            {
-                if (pending.Count >= MaxPending) { Interlocked.Increment(ref cDrop); return; }
-                pending.Add(r);
-            }
-        }
+        // ═══════════════════════ 过滤 / 上屏 ═══════════════════════
 
         bool Pass(RowInfo r)
         {
-            if (fltTextOnly)
-            {
-                if (!r.IsAscii && r.Name != "STATUSTEXT" && r.Name != "TEXT") return false;
-            }
+            if (fltTextOnly && r.Name != "STATUSTEXT") return false;
             if (fltDir == 1 && r.Sent) return false;
             if (fltDir == 2 && !r.Sent) return false;
             string f = fltText;
             if (f != null && f.Length > 0)
             {
-                string[] parts = f.Split(new char[] { ',', ';', '|' });
+                string[] parts = f.Split(new char[] { ',', ';', '|', ' ' });
                 bool any = false;
                 for (int i = 0; i < parts.Length; i++)
                 {
@@ -1710,7 +1247,7 @@ namespace ZhSerial
         {
             if (fm == null || fm.IsDisposed) return;
 
-            // 把过滤条件从控件搬到快照（收包线程只读快照）
+            // 控件只能在 UI 线程读，映射成快照给收包线程用
             try
             {
                 fltTextOnly = chkTextOnly != null && chkTextOnly.Checked;
@@ -1719,6 +1256,21 @@ namespace ZhSerial
                 fltText = t == null ? "" : t.Trim();
             }
             catch { }
+
+            // 新出现的消息类型补进下拉
+            List<TypeItem> add = null;
+            lock (typeLock)
+            {
+                if (typePending.Count > 0)
+                {
+                    add = new List<TypeItem>(typePending);
+                    typePending.Clear();
+                }
+            }
+            if (add != null && cmbMsgType != null)
+            {
+                for (int i = 0; i < add.Count; i++) cmbMsgType.Items.Add(add[i]);
+            }
 
             List<RowInfo> batch = null;
             lock (pending)
@@ -1729,22 +1281,29 @@ namespace ZhSerial
                     pending.Clear();
                 }
             }
-            if (batch != null && grid != null && !grid.IsDisposed)
+            if (batch != null)
             {
-                grid.SuspendLayout();
-                try
+                List<RowInfo> shown = new List<RowInfo>();
+                for (int i = 0; i < batch.Count; i++)
+                    if (Pass(batch[i])) shown.Add(batch[i]);
+
+                if (shown.Count > 0 && grid != null && !grid.IsDisposed)
                 {
-                    for (int i = 0; i < batch.Count; i++) AddRow(batch[i]);
-                    int over = grid.RowCount - MaxRows;
-                    for (int i = 0; i < over; i++) grid.Rows.RemoveAt(0);
+                    grid.SuspendLayout();
+                    try
+                    {
+                        for (int i = 0; i < shown.Count; i++) AddRow(shown[i]);
+                        int over = grid.RowCount - MaxRows;
+                        for (int i = 0; i < over; i++) grid.Rows.RemoveAt(0);
+                    }
+                    catch { }
+                    grid.ResumeLayout();
+                    if (chkAutoScroll != null && chkAutoScroll.Checked && grid.RowCount > 0)
+                    {
+                        try { grid.FirstDisplayedScrollingRowIndex = grid.RowCount - 1; } catch { }
+                    }
                 }
-                catch { }
-                grid.ResumeLayout();
-                if (chkAutoScroll != null && chkAutoScroll.Checked && grid.RowCount > 0)
-                {
-                    try { grid.FirstDisplayedScrollingRowIndex = grid.RowCount - 1; } catch { }
-                }
-                PrintRows(batch);
+                if (shown.Count > 0) PrintRows(shown);
             }
             UpdateStats();
         }
@@ -1754,16 +1313,15 @@ namespace ZhSerial
             int idx = grid.Rows.Add();
             DataGridViewRow row = grid.Rows[idx];
             row.Cells[0].Value = r.Time.ToString("HH:mm:ss.fff");
-            row.Cells[1].Value = r.IsAscii ? "文本" : (r.Sent ? "发" : "收");
+            row.Cells[1].Value = r.Sent ? "发" : "收";
             row.Cells[2].Value = r.Name;
-            row.Cells[3].Value = r.IsAscii ? "" : r.MsgId.ToString();
-            row.Cells[4].Value = r.IsAscii ? "" : (r.SysId + " / " + r.CompId);
-            row.Cells[5].Value = r.IsAscii ? "" : r.Seq.ToString();
+            row.Cells[3].Value = r.MsgId.ToString();
+            row.Cells[4].Value = r.SysId + " / " + r.CompId;
+            row.Cells[5].Value = r.Seq.ToString();
             row.Cells[6].Value = r.Len.ToString();
             row.Cells[7].Value = r.Content;
             row.Tag = r;
             if (r.Sent) row.DefaultCellStyle.BackColor = Color.FromArgb(238, 245, 255);
-            if (r.IsAscii) row.DefaultCellStyle.ForeColor = Color.FromArgb(0, 110, 90);
             else if (r.Name == "STATUSTEXT")
             {
                 int sev = 6;
@@ -1772,7 +1330,7 @@ namespace ZhSerial
                 {
                     FieldInfo[] fs = GetFields(d.GetType());
                     for (int i = 0; i < fs.Length; i++)
-                        if (fs[i].Name == "severity") sev = SysIdToInt(SafeGet(fs[i], d), 6);
+                        if (fs[i].Name == "severity") sev = ToIntVal(SafeGet(fs[i], d), 6);
                 }
                 row.DefaultCellStyle.ForeColor = SevColor(sev);
             }
@@ -1786,10 +1344,9 @@ namespace ZhSerial
                 long delta = now - lastBytes;
                 lastBytes = now;
                 if (lblRate != null) lblRate.Text = FmtRate(delta * 5);
-                string s = "收 " + Interlocked.Read(ref cRx) + " / 发 " + Interlocked.Read(ref cTx)
-                    + " / 文本 " + Interlocked.Read(ref cAscii)
-                    + " / 丢弃 " + Interlocked.Read(ref cDrop);
-                if (lblCnt != null) lblCnt.Text = s;
+                if (lblCnt != null)
+                    lblCnt.Text = "收 " + Interlocked.Read(ref cRx) + " / 发 " + Interlocked.Read(ref cTx)
+                        + " / 丢弃 " + Interlocked.Read(ref cDrop);
             }
             catch { }
         }
@@ -1814,8 +1371,6 @@ namespace ZhSerial
             try { if (txtDetail != null) txtDetail.Text = ""; } catch { }
             Interlocked.Exchange(ref cRx, 0);
             Interlocked.Exchange(ref cTx, 0);
-            Interlocked.Exchange(ref cAscii, 0);
-            Interlocked.Exchange(ref cErr, 0);
             Interlocked.Exchange(ref cBytes, 0);
             Interlocked.Exchange(ref cDrop, 0);
             lastBytes = 0;
@@ -1832,10 +1387,11 @@ namespace ZhSerial
                 if (grid == null || grid.SelectedRows.Count == 0) { txtDetail.Text = ""; return; }
                 RowInfo r = grid.SelectedRows[0].Tag as RowInfo;
                 if (r == null) { txtDetail.Text = ""; return; }
+
                 StringBuilder sb = new StringBuilder();
                 sb.Append("时间      : ").Append(r.Time.ToString("yyyy-MM-dd HH:mm:ss.fff")).Append("\r\n");
-                sb.Append("方向      : ").Append(r.IsAscii ? "串口文本" : (r.Sent ? "发送" : "接收")).Append("\r\n");
-                sb.Append("消息      : ").Append(r.Name).Append("  (ID ").Append(r.MsgId == 0xFFFFFFFF ? "-" : r.MsgId.ToString()).Append(")\r\n");
+                sb.Append("方向      : ").Append(r.Sent ? "发送" : "接收").Append("\r\n");
+                sb.Append("消息      : ").Append(r.Name).Append("  (ID ").Append(r.MsgId).Append(")\r\n");
                 sb.Append("系统/组件 : ").Append(r.SysId).Append(" / ").Append(r.CompId).Append("\r\n");
                 sb.Append("序号      : ").Append(r.Seq).Append("    帧长: ").Append(r.Len).Append(" B");
                 if (r.Payload > 0) sb.Append("    载荷: ").Append(r.Payload).Append(" B");
@@ -1851,10 +1407,6 @@ namespace ZhSerial
                         object v = SafeGet(fs[i], d);
                         sb.Append(fs[i].Name).Append(" = ").Append(FmtVal(v)).Append("\r\n");
                     }
-                }
-                else if (r.IsAscii)
-                {
-                    sb.Append("\r\n文本内容：\r\n").Append(r.Content).Append("\r\n");
                 }
 
                 sb.Append("\r\n── 原始字节 ──\r\n");
@@ -1921,19 +1473,16 @@ namespace ZhSerial
             for (int i = 0; i < rows.Count; i++)
             {
                 RowInfo r = rows[i];
-                if (r.IsAscii) AppendPrint(r.Time.ToString("HH:mm:ss.fff") + "  " + r.Content, Color.FromArgb(0, 110, 90));
-                else if (r.Name == "STATUSTEXT")
+                if (r.Name != "STATUSTEXT") continue;
+                int sev = 6;
+                object d = r.Data;
+                if (d != null)
                 {
-                    int sev = 6;
-                    object d = r.Data;
-                    if (d != null)
-                    {
-                        FieldInfo[] fs = GetFields(d.GetType());
-                        for (int j = 0; j < fs.Length; j++)
-                            if (fs[j].Name == "severity") sev = SysIdToInt(SafeGet(fs[j], d), 6);
-                    }
-                    AppendPrint(r.Time.ToString("HH:mm:ss.fff") + "  " + r.Content, SevColor(sev));
+                    FieldInfo[] fs = GetFields(d.GetType());
+                    for (int j = 0; j < fs.Length; j++)
+                        if (fs[j].Name == "severity") sev = ToIntVal(SafeGet(fs[j], d), 6);
                 }
+                AppendPrint(r.Time.ToString("HH:mm:ss.fff") + "  " + r.Content, SevColor(sev));
             }
             txtPrint.ResumeLayout();
         }
@@ -1944,12 +1493,12 @@ namespace ZhSerial
         {
             StringBuilder sb = new StringBuilder();
             sb.Append(r.Time.ToString("yyyy-MM-dd HH:mm:ss.fff")).Append('\t');
-            sb.Append(r.IsAscii ? "文本" : (r.Sent ? "发" : "收")).Append('\t');
+            sb.Append(r.Sent ? "发" : "收").Append('\t');
             sb.Append(r.Name).Append('\t');
-            sb.Append(r.IsAscii ? "" : r.MsgId.ToString()).Append('\t');
-            sb.Append(r.IsAscii ? "" : r.SysId.ToString()).Append('\t');
-            sb.Append(r.IsAscii ? "" : r.CompId.ToString()).Append('\t');
-            sb.Append(r.IsAscii ? "" : r.Seq.ToString()).Append('\t');
+            sb.Append(r.MsgId.ToString()).Append('\t');
+            sb.Append(r.SysId.ToString()).Append('\t');
+            sb.Append(r.CompId.ToString()).Append('\t');
+            sb.Append(r.Seq.ToString()).Append('\t');
             sb.Append(r.Len.ToString()).Append('\t');
             sb.Append(r.Content);
             if (r.Raw != null) sb.Append('\t').Append(HexShort(r.Raw, 64));
@@ -1961,12 +1510,12 @@ namespace ZhSerial
             if (grid == null || grid.RowCount == 0) { SetState("没有可保存的记录"); return; }
             SaveFileDialog sfd = new SaveFileDialog();
             sfd.Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
-            sfd.FileName = "serial-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt";
+            sfd.FileName = "telemetry-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt";
             if (sfd.ShowDialog() != DialogResult.OK) return;
             try
             {
                 StringBuilder sb = new StringBuilder();
-                sb.Append("# 飞控串口监听 v").Append(Version)
+                sb.Append("# 遥测通信监听 v").Append(Version)
                   .Append("  导出时间 ").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append("\r\n");
                 sb.Append("# 时间\t方向\t消息\tID\tsysid\tcompid\tseq\t帧长\t内容\t原始字节\r\n");
                 for (int i = 0; i < grid.RowCount; i++)
@@ -1986,7 +1535,7 @@ namespace ZhSerial
             if (grid == null || grid.RowCount == 0) { SetState("没有可导出的记录"); return; }
             SaveFileDialog sfd = new SaveFileDialog();
             sfd.Filter = "原始帧 (*.bin)|*.bin|所有文件 (*.*)|*.*";
-            sfd.FileName = "serial-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".bin";
+            sfd.FileName = "telemetry-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".bin";
             if (sfd.ShowDialog() != DialogResult.OK) return;
             try
             {
@@ -1995,7 +1544,7 @@ namespace ZhSerial
                     for (int i = 0; i < grid.RowCount; i++)
                     {
                         RowInfo r = grid.Rows[i].Tag as RowInfo;
-                        if (r != null && r.Raw != null && !r.IsAscii) fs.Write(r.Raw, 0, r.Raw.Length);
+                        if (r != null && r.Raw != null) fs.Write(r.Raw, 0, r.Raw.Length);
                     }
                 }
                 SetState("已导出原始帧：" + sfd.FileName);
@@ -2009,7 +1558,7 @@ namespace ZhSerial
             if (grid == null || grid.SelectedRows.Count == 0) return;
             SaveFileDialog sfd = new SaveFileDialog();
             sfd.Filter = "原始帧 (*.bin)|*.bin|所有文件 (*.*)|*.*";
-            sfd.FileName = "serial-sel-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".bin";
+            sfd.FileName = "telemetry-sel-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".bin";
             if (sfd.ShowDialog() != DialogResult.OK) return;
             try
             {
@@ -2055,28 +1604,15 @@ namespace ZhSerial
 
         // ═══════════════════════ 小工具 ═══════════════════════
 
-        static int ToInt(string s, int dflt)
-        {
-            if (s == null) return dflt;
-            int v;
-            if (int.TryParse(s.Trim(), out v)) return v;
-            return dflt;
-        }
-
         void UpdateSrc()
         {
             if (lblSrc == null || lblSrc.IsDisposed) return;
-            if (rbPort != null && rbPort.Checked)
-            {
-                if (sp != null) lblSrc.Text = "PC 串口：" + sp.PortName + " @ " + sp.BaudRate;
-                else lblSrc.Text = "PC 串口：未打开";
-                return;
-            }
-            string t = "MP：未连接";
+            string t = "源：MP 未连接";
             try
             {
                 if (MainV2.comPort != null && MainV2.comPort.BaseStream != null && MainV2.comPort.BaseStream.IsOpen)
-                    t = "MP：" + MainV2.comPort.BaseStream.PortName + " @ " + MainV2.comPort.BaseStream.BaudRate;
+                    t = "源：MP 当前连接  " + MainV2.comPort.BaseStream.PortName
+                        + " @ " + MainV2.comPort.BaseStream.BaudRate + "（自动跟随）";
             }
             catch { }
             lblSrc.Text = t;

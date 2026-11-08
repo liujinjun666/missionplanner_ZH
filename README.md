@@ -15,7 +15,7 @@
 | `feature/mp-cn` | **MP 中文化**：界面汉化、品牌替换、中文参数表、菜单汉化、快捷视图汉化 | `mp-cn/` | v1.1 |
 | `feature/ecu-panel` | **玄云 ECU 控件**：飞行数据页 ECU 面板（转速/排气温度/推力/油量等遥测 + 双向控制） | `ecu-panel/` | v1.2 |
 | `feature/net-panel` | **飞控网口调试控件**：NET_P1~P4 四个网口读写、高亮、通讯指示、抓包监听 | `net-panel/` | v1.1 |
-| `feature/serial-monitor` | **飞控串口监听工具**：收发报文列表、字段/十六进制详情、STATUSTEXT 与 ASCII 打印、过滤/保存/导出、飞控串口自动识别（可接管 MP 串口）+ 波特率自动扫描 | `serial-monitor/` | v1.0 |
+| `feature/serial-monitor` | **遥测通信监听**：监听 MP 当前连接的收发报文、字段/十六进制详情、消息类型单选+多选、STATUSTEXT 打印着色、过滤/保存/导出、发送页（MAV_CMD 命令 + 写参数） | `serial-monitor/` | v1.0 |
 
 工作方式：
 
@@ -43,7 +43,7 @@ git commit -m "net: 同步网口控件改动"
 | `mpcn:` | MP 中文化（汉化词条、品牌、参数表）→ `mp-cn/` |
 | `ecu:` | 玄云 ECU 控件 → `ecu-panel/` |
 | `net:` | 飞控网口调试控件 → `net-panel/` |
-| `serial:` | 飞控串口监听工具 → `serial-monitor/` |
+| `serial:` | 遥测通信监听 → `serial-monitor/` |
 | `docs:` / `chore:` | 文档、脚本（`docs/`、`packages/`）、仓库维护 |
 
 示例：
@@ -74,8 +74,8 @@ net-panel/                    【feature/net-panel】飞控网口调试控件
   zh-net.cs                   NET_P1~P4 读写/高亮/通讯指示/抓包（v1.1，47,987 字节）
   一键部署zh-net插件.bat        本机部署（拷贝+校验+可选自动重启 MP）
 
-serial-monitor/               【feature/serial-monitor】飞控串口监听工具
-  zh-serial.cs                双源监听：MP 连接透听 / 独立串口嗅探（v1.0）
+serial-monitor/               【feature/serial-monitor】遥测通信监听
+  zh-serial.cs                只监听 MP 连接：报文/发送/打印三页（v1.0）
   一键部署zh-serial插件.bat     本机部署（拷贝+校验+可选自动重启 MP）
   README.md                   使用说明与坑位
 
@@ -106,7 +106,7 @@ C:\Program Files (x86)\Mission Planner\plugins\
   脚本会拷贝、打印实际字节数并询问是否自动重启 MP。
 - `ecu-panel/zh-ecu.cs`、`mp-cn/*.cs`、`serial-monitor/zh-serial.cs`：同样复制到上述目录后重启 MP。
 
-验证入口：MP「飞行数据」页工具栏 →「玄云ECU」「飞控网口」「串口监听」三个勾选框。
+验证入口：MP「飞行数据」页工具栏 →「玄云ECU」「飞控网口」「遥测通信监听」三个勾选框。
 
 注意：`.cs` 插件由 MP 启动时用 Roslyn 现场编译，**编译失败不会报错，只会静默不加载**。
 排查时看 `zh-diag.cs` 导出的 `C:\ProgramData\Mission Planner\zh_plugin_errors.txt`（含 Roslyn 报错原文）。
@@ -128,7 +128,7 @@ C:\Program Files (x86)\Mission Planner\plugins\
 |---|---|---|---|
 | 2026-11-05 | ECU 控件 | v1.2 | 面板收窄至 395px，遥测列重排 |
 | 2026-11-08 | 网口调试控件 | v1.1 | 四网口读写/高亮/通讯指示/监听抓包；修文字底色、框线、监听卡死与闪退 |
-| 2026-11-08 | 串口监听工具 | v1.0 | 双源监听（MP 透听 / 独立串口）、字段与 hex 详情、STATUSTEXT 与 ASCII 打印着色、过滤/保存/导出、波特率自动扫描 |
+| 2026-11-08 | 遥测通信监听 | v1.0 | 只监听 MP 连接（收/发双向）、字段与 hex 详情、STATUSTEXT 打印着色、消息类型单选+多选、过滤/保存/导出、发送页（MAV_CMD 命令 + 写参数） |
 | 2026-11-08 | 仓库 | — | 目录结构改为按模块分子目录（`mp-cn/` `ecu-panel/` `net-panel/`） |
 
 ## 仓库内容边界（重要）
