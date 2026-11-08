@@ -62,6 +62,16 @@ namespace ZhSerial
         Label lblSrc, lblState;
         ToolStripStatusLabel lblCnt, lblRate;
 
+        // ── 飞控串口（SERIALn）视图 ──
+        TabPage tabPorts;
+        DataGridView gridPorts;
+        Label lblPortHint;
+        readonly Dictionary<int, int> portProto = new Dictionary<int, int>();
+        readonly Dictionary<int, double> portBaud = new Dictionary<int, double>();
+        int filterPort = -1;                 // -1 = 不过滤
+        HashSet<uint> filterIds;
+        int portAutoTick;
+
         // ── 数据缓冲 ──
         readonly List<RowInfo> pending = new List<RowInfo>();
         System.Windows.Forms.Timer uiTimer;
@@ -107,9 +117,9 @@ namespace ZhSerial
                 Form mf = Host.MainForm as Form;
                 if (mf == null || mf.IsDisposed) return true;
                 if (mf.InvokeRequired)
-                    mf.BeginInvoke((Action)delegate { EnsureUI(); AttachMp(); UpdateSrc(); });
+                    mf.BeginInvoke((Action)delegate { EnsureUI(); AttachMp(); UpdateSrc(); AutoPorts(); });
                 else
-                { EnsureUI(); AttachMp(); UpdateSrc(); }
+                { EnsureUI(); AttachMp(); UpdateSrc(); AutoPorts(); }
             }
             catch { }
             return true;
@@ -268,7 +278,7 @@ namespace ZhSerial
             top.Controls.Add(rbMp);
 
             rbPort = new RadioButton();
-            rbPort.Text = "飞控串口";
+            rbPort.Text = "PC 串口";
             rbPort.AutoSize = true;
             rbPort.Location = new Point(150, 12);
             rbPort.CheckedChanged += ModeChanged;
@@ -505,6 +515,84 @@ namespace ZhSerial
             txtPrint.BorderStyle = BorderStyle.None;
             p2.Controls.Add(txtPrint);
 
+            // ── 飞控串口（SERIALn）视图 ──
+            tabPorts = new TabPage("飞控串口");
+            tabPorts.BackColor = Color.White;
+            tabs.TabPages.Add(tabPorts);
+            tabs.TabPages.Remove(tabPorts);
+            tabs.TabPages.Insert(1, tabPorts);   // 顺序：报文 / 飞控串口 / 打印
+
+            Panel pt = new Panel();
+            pt.Dock = DockStyle.Top;
+            pt.Height = 36;
+            tabPorts.Controls.Add(pt);
+
+            Button btnReadPorts = new Button();
+            btnReadPorts.Text = "读取串口配置";
+            btnReadPorts.Location = new Point(8, 6);
+            btnReadPorts.Size = new Size(100, 25);
+            btnReadPorts.Click += delegate { RefreshSerialPorts(); };
+            pt.Controls.Add(btnReadPorts);
+
+            Button btnOnlyPort = new Button();
+            btnOnlyPort.Text = "只看此口";
+            btnOnlyPort.Location = new Point(114, 6);
+            btnOnlyPort.Size = new Size(80, 25);
+            btnOnlyPort.Click += delegate { FilterOnlySelectedPort(); };
+            pt.Controls.Add(btnOnlyPort);
+
+            Button btnAllPorts = new Button();
+            btnAllPorts.Text = "显示全部";
+            btnAllPorts.Location = new Point(200, 6);
+            btnAllPorts.Size = new Size(80, 25);
+            btnAllPorts.Click += delegate
+            {
+                filterPort = -1;
+                filterIds = null;
+                UpdatePortHint();
+            };
+            pt.Controls.Add(btnAllPorts);
+
+            lblPortHint = new Label();
+            lblPortHint.Dock = DockStyle.Bottom;
+            lblPortHint.Height = 46;
+            lblPortHint.ForeColor = Color.FromArgb(90, 90, 90);
+            lblPortHint.Padding = new Padding(8, 4, 8, 4);
+            lblPortHint.Text = "点「读取串口配置」从飞控读取 SERIALn_PROTOCOL / SERIALn_BAUD。";
+            tabPorts.Controls.Add(lblPortHint);
+
+            gridPorts = new DataGridView();
+            gridPorts.Dock = DockStyle.Fill;
+            gridPorts.ReadOnly = true;
+            gridPorts.AllowUserToAddRows = false;
+            gridPorts.AllowUserToDeleteRows = false;
+            gridPorts.AllowUserToResizeRows = false;
+            gridPorts.RowHeadersVisible = false;
+            gridPorts.MultiSelect = false;
+            gridPorts.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            gridPorts.BackgroundColor = Color.White;
+            gridPorts.GridColor = Color.FromArgb(224, 224, 224);
+            gridPorts.BorderStyle = BorderStyle.None;
+            gridPorts.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei", 9F);
+            gridPorts.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(245, 245, 245);
+            gridPorts.EnableHeadersVisualStyles = false;
+            gridPorts.DefaultCellStyle.Font = new Font("Microsoft YaHei", 9F);
+            gridPorts.DefaultCellStyle.BackColor = Color.White;
+            gridPorts.DefaultCellStyle.ForeColor = Color.Black;
+            gridPorts.DefaultCellStyle.SelectionBackColor = Color.FromArgb(51, 153, 255);
+            gridPorts.DefaultCellStyle.SelectionForeColor = Color.White;
+            gridPorts.RowTemplate.Height = 24;
+            gridPorts.CellDoubleClick += delegate { FilterOnlySelectedPort(); };
+            gridPorts.Columns.Add(PortCol("串口", 150));
+            gridPorts.Columns.Add(PortCol("协议", 190));
+            gridPorts.Columns.Add(PortCol("波特率", 76));
+            DataGridViewTextBoxColumn cEffect = PortCol("能否看到数据 / 对应上报报文", 320);
+            cEffect.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+            cEffect.MinimumWidth = 240;
+            gridPorts.Columns.Add(cEffect);
+            tabPorts.Controls.Add(gridPorts);
+            gridPorts.BringToFront();
+
             StatusStrip ss = new StatusStrip();
             lblCnt = new ToolStripStatusLabel("收 0 / 发 0");
             lblRate = new ToolStripStatusLabel("0 B/s");
@@ -520,7 +608,7 @@ namespace ZhSerial
 
             RefreshPorts();
             SetModeEnabled(false);
-            PrintSys("就绪。「MP 当前连接」直接看 MP 与飞控的收发；「飞控串口」自动定位飞控所在串口，可抓原始字节与打印。");
+            PrintSys("就绪。「MP 当前连接」看 MP 与飞控的收发；「飞控串口」页看 SERIALn 的协议配置与归属报文；「PC 串口」抓电脑上 COM 口的原始字节。");
         }
 
         DataGridViewTextBoxColumn AddCol(string text, int width)
@@ -538,6 +626,15 @@ namespace ZhSerial
         {
             c.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
             c.MinimumWidth = 200;
+        }
+
+        static DataGridViewTextBoxColumn PortCol(string text, int width)
+        {
+            DataGridViewTextBoxColumn c = new DataGridViewTextBoxColumn();
+            c.HeaderText = text;
+            c.Width = width;
+            c.SortMode = DataGridViewColumnSortMode.NotSortable;
+            return c;
         }
 
         void SetModeEnabled(bool portMode)
@@ -559,8 +656,8 @@ namespace ZhSerial
             if (portMode)
             {
                 DetachMp();
-                SetState("飞控串口模式：已自动定位飞控串口，确认波特率后点「打开」");
-                PrintSys("切换到飞控串口模式（自动定位 MP 对应的串口）");
+                SetState("PC 串口模式：监听电脑上的 COM 口（直连/旁路），确认后点「打开」");
+                PrintSys("切换到 PC 串口模式（监听电脑上的 COM 口）");
             }
             else
             {
@@ -617,6 +714,8 @@ namespace ZhSerial
                 r.Payload = PayloadLen(r.Raw);
                 r.Content = BuildContent(r);
                 Count(r);
+                // 「只看某个飞控串口」过滤：按协议的报文集合筛
+                if (filterPort >= 0 && filterIds != null && !filterIds.Contains(r.MsgId)) return;
                 Enqueue(r);
             }
             catch { }
@@ -1329,6 +1428,238 @@ namespace ZhSerial
             }
         }
 
+        // ═══════════════════════ 飞控串口 SERIALn（协议 + 报文归属） ═══════════════════════
+
+        // 参数下载完成后自动读一次串口配置（每 5 秒试一次，读到就不再试）
+        void AutoPorts()
+        {
+            if (gridPorts == null || gridPorts.IsDisposed) return;
+            if (gridPorts.Rows.Count > 0) return;
+            portAutoTick++;
+            if (portAutoTick % 5 != 0) return;
+            RefreshSerialPorts();
+        }
+
+        static bool TryParam(string name, out double v)
+        {
+            v = 0;
+            try
+            {
+                if (MainV2.comPort == null || MainV2.comPort.MAV == null) return false;
+                var prms = MainV2.comPort.MAV.param;      // MAVLinkParamList
+                if (prms == null || !prms.ContainsKey(name)) return false;
+                v = (float)prms[name];
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static Dictionary<int, string> protoNames;
+
+        static Dictionary<int, string> ProtoNames()
+        {
+            if (protoNames != null) return protoNames;
+            Dictionary<int, string> d = new Dictionary<int, string>();
+            d[-1] = "未配置";
+            d[1] = "MAVLink1";
+            d[2] = "MAVLink2";
+            d[3] = "FrSky D";
+            d[4] = "FrSky SPort";
+            d[5] = "GPS";
+            d[7] = "Alexmos 云台";
+            d[8] = "云台";
+            d[9] = "测距雷达";
+            d[10] = "FrSky SPort 透传";
+            d[11] = "Lidar360";
+            d[13] = "信标";
+            d[14] = "Volz 舵机";
+            d[15] = "SBus 舵机";
+            d[16] = "ESC 电调遥测";
+            d[17] = "Devo 遥测";
+            d[18] = "光流";
+            d[19] = "Robotis 舵机";
+            d[20] = "NMEA 输出";
+            d[21] = "风向标";
+            d[22] = "SLCAN(DroneCAN)";
+            d[23] = "RCIN";
+            d[24] = "EFI（发动机）";
+            d[25] = "LTM";
+            d[26] = "RunCam";
+            d[27] = "HoTT 遥测";
+            d[28] = "脚本 Scripting";
+            d[29] = "Crossfire VTX";
+            d[30] = "发电机";
+            d[31] = "绞车";
+            d[32] = "MSP";
+            d[33] = "DJI FPV";
+            d[34] = "空速计";
+            d[35] = "ADS-B";
+            d[36] = "AHRS";
+            d[37] = "SmartAudio";
+            d[38] = "FETtec OneWire";
+            d[39] = "Torqeedo";
+            d[40] = "AIS";
+            d[41] = "CoDevESC";
+            d[42] = "DisplayPort";
+            d[43] = "MAVLink 低带宽";
+            d[44] = "IRC Tramp";
+            d[45] = "DDS XRCE";
+            d[46] = "IMU 数据";
+            d[48] = "PPP";
+            d[49] = "i-BUS 遥测";
+            d[50] = "IOMCU";
+            protoNames = d;
+            return d;
+        }
+
+        static string ProtoName(int p)
+        {
+            string n;
+            if (ProtoNames().TryGetValue(p, out n)) return n;
+            if (p < 0) return "未配置";
+            return "自定义（" + p + "）";
+        }
+
+        // 协议 → 该口数据会被固件封装成哪些 MAVLink 报文（用数字 ID，稳定且不依赖枚举名）
+        static HashSet<uint> MsgIdsForProto(int p)
+        {
+            HashSet<uint> s = new HashSet<uint>();
+            switch (p)
+            {
+                case 24: s.Add(225); break;                        // EFI_STATUS
+                case 5: s.Add(24); s.Add(124); s.Add(233); break;  // GPS_RAW_INT / GPS2_RAW / GPS_RTCM_DATA
+                case 16: s.Add(291); break;                        // ESC_STATUS
+                case 23: s.Add(65); break;                         // RC_CHANNELS
+                case 9: s.Add(132); break;                         // DISTANCE_SENSOR
+                case 35: s.Add(246); break;                        // ADSB_VEHICLE
+                case 30: s.Add(373); break;                        // GENERATOR_STATUS
+                case 31: s.Add(9005); break;                       // WINCH_STATUS
+                case 28: s.Add(251); s.Add(253); break;            // NAMED_VALUE_FLOAT / STATUSTEXT
+                default: break;                                    // 空集合 = 固件不上报
+            }
+            return s;
+        }
+
+        static string PortEffect(int p)
+        {
+            if (p < 0) return "未配置：固件不会上报该口数据，只能靠透传或硬件旁路抓原始字节";
+            if (p == 1 || p == 2 || p == 43)
+                return "MAVLink 链路：MP 若正走这个口，「报文」页就是它的全部收发";
+            HashSet<uint> s = MsgIdsForProto(p);
+            if (s.Count == 0)
+                return "固件不上报该口数据（" + ProtoName(p) + "），只能靠透传或硬件旁路抓原始字节";
+            StringBuilder sb = new StringBuilder("经 MAVLink 上报：");
+            int i = 0;
+            foreach (uint id in s)
+            {
+                if (i++ > 0) sb.Append("、");
+                sb.Append(MsgName(id));
+            }
+            return sb.ToString();
+        }
+
+        void RefreshSerialPorts()
+        {
+            if (gridPorts == null || gridPorts.IsDisposed) return;
+            gridPorts.Rows.Clear();
+            portProto.Clear();
+            portBaud.Clear();
+
+            int found = 0;
+            for (int i = 0; i <= 9; i++)
+            {
+                double pv;
+                if (!TryParam("SERIAL" + i + "_PROTOCOL", out pv)) continue;
+                double bv;
+                TryParam("SERIAL" + i + "_BAUD", out bv);
+                int proto = (int)Math.Round(pv);
+                portProto[i] = proto;
+                portBaud[i] = bv;
+
+                int row = gridPorts.Rows.Add();
+                DataGridViewRow r = gridPorts.Rows[row];
+                r.Tag = i;
+                r.Cells[0].Value = "SERIAL" + i + (i == 0 ? "（USB/控制台）" : "");
+                r.Cells[1].Value = ProtoName(proto);
+                r.Cells[2].Value = bv > 0 ? bv.ToString("0") : "-";
+                r.Cells[3].Value = PortEffect(proto);
+                if (i == filterPort) r.DefaultCellStyle.BackColor = Color.FromArgb(232, 244, 255);
+                found++;
+            }
+
+            if (found == 0)
+            {
+                lblPortHint.Text = "未读到 SERIALn_PROTOCOL：请先连接飞控，等参数下载完成后再点「读取串口配置」。";
+                return;
+            }
+            if (gridPorts.Rows.Count > 0 && gridPorts.SelectedRows.Count == 0)
+                gridPorts.Rows[0].Selected = true;
+            UpdatePortHint();
+            SetState("已读取 " + found + " 个飞控串口的协议配置");
+        }
+
+        void FilterOnlySelectedPort()
+        {
+            if (gridPorts == null || gridPorts.SelectedRows.Count == 0)
+            {
+                SetState("请先在表格里选中一个串口");
+                return;
+            }
+            object t = gridPorts.SelectedRows[0].Tag;
+            if (t == null) return;
+            int port = (int)t;
+            int proto;
+            if (!portProto.TryGetValue(port, out proto)) return;
+
+            HashSet<uint> set = MsgIdsForProto(proto);
+            if (proto == 1 || proto == 2 || proto == 43)
+            {
+                filterPort = -1;
+                filterIds = null;
+                MessageBox.Show(fm,
+                    "SERIAL" + port + " 是 MAVLink 链路。\n\n"
+                    + "MP 与飞控之间的全部收发都走这条链路，所以「报文」页看到的就是它；\n"
+                    + "无法从报文里再区分「是哪个口进来的」，因为没有来源标记。",
+                    "MAVLink 口", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                UpdatePortHint();
+                return;
+            }
+            if (set.Count == 0)
+            {
+                MessageBox.Show(fm,
+                    "SERIAL" + port + "（" + ProtoName(proto) + "）没有对应的上报报文。\n\n"
+                    + PortEffect(proto) + "\n\n"
+                    + "原因：飞控板上的 UART 是内部总线，只有固件主动封装成 MAVLink 的数据才能到 MP。\n"
+                    + "未配置/自定义协议的口，要看到原始字节只能：\n"
+                    + "  ① 固件侧透传（SERIAL_PASS1/PASS2，会把该口桥到某个物理串口）\n"
+                    + "  ② 硬件旁路（把该 UART 的 TX 接到 USB-TTL，用「PC 串口」模式抓）",
+                    "该口没有可看的报文", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            filterPort = port;
+            filterIds = set;
+            if (tabs.TabPages.Count > 0) tabs.SelectedTab = tabs.TabPages[0];
+            UpdatePortHint();
+            SetState("过滤：只看 SERIAL" + port + "（" + ProtoName(proto) + "）相关报文");
+        }
+
+        void UpdatePortHint()
+        {
+            if (lblPortHint == null || lblPortHint.IsDisposed) return;
+            if (filterPort < 0 || filterIds == null)
+            {
+                lblPortHint.Text = "当前显示全部报文。选中某个 SERIALn → 点「只看此口」，即可只看该口对应的上报报文。\r\n"
+                    + "注意：飞控 UART 是内部总线，只有固件主动封装成 MAVLink 的数据才能到 MP；"
+                    + "未配置/自定义协议的口需固件透传或硬件旁路才能看到原始字节。";
+                return;
+            }
+            int proto;
+            portProto.TryGetValue(filterPort, out proto);
+            lblPortHint.Text = "当前只显示 SERIAL" + filterPort + "（" + ProtoName(proto) + "）对应的上报报文。\r\n"
+                + "点「显示全部」可取消过滤。";
+        }
+
         // ═══════════════════════ 统计 / 入队 / 上屏 ═══════════════════════
 
         void Count(RowInfo r)
@@ -1737,8 +2068,8 @@ namespace ZhSerial
             if (lblSrc == null || lblSrc.IsDisposed) return;
             if (rbPort != null && rbPort.Checked)
             {
-                if (sp != null) lblSrc.Text = "飞控串口：" + sp.PortName + " @ " + sp.BaudRate;
-                else lblSrc.Text = "飞控串口：未打开";
+                if (sp != null) lblSrc.Text = "PC 串口：" + sp.PortName + " @ " + sp.BaudRate;
+                else lblSrc.Text = "PC 串口：未打开";
                 return;
             }
             string t = "MP：未连接";
