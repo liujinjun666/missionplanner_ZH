@@ -1,5 +1,5 @@
 // zh-serial.cs —— 飞控串口监听工具 v1.0
-// 两种源：① MP 当前连接（挂在 MAVLink 收发事件上，零配置）② 独立串口（自己开 COM 口，可自动扫描波特率）
+// 两种源：① MP 当前连接（挂在 MAVLink 收发事件上，零配置）② 飞控串口（自动定位飞控 COM 口，可接管 MP 占用的串口）
 // 内容：报文列表（时间/方向/消息/ID/系统组件/序号/长度/摘要）+ 选中行字段与十六进制
 //       打印页（STATUSTEXT 告警文本 + 串口 ASCII 调试行）+ 过滤/暂停/保存/导出原始帧
 using System;
@@ -29,7 +29,7 @@ namespace ZhSerial
         public int Payload;
         public string Content = "";
         public byte[] Raw;
-        public object Data;        // MAVLink 解析后的结构体（独立串口模式为 null）
+        public object Data;        // MAVLink 解析后的结构体（飞控串口模式为 null）
     }
 
     public class ZhSerialPlugin : MissionPlanner.Plugin.Plugin
@@ -77,7 +77,7 @@ namespace ZhSerial
         // ── MP 事件挂钩 ──
         MissionPlanner.MAVLinkInterface attached;
 
-        // ── 独立串口 ──
+        // ── 飞控串口 ──
         System.IO.Ports.SerialPort sp;
         Thread th;
         volatile bool running;
@@ -268,14 +268,14 @@ namespace ZhSerial
             top.Controls.Add(rbMp);
 
             rbPort = new RadioButton();
-            rbPort.Text = "独立串口";
+            rbPort.Text = "飞控串口";
             rbPort.AutoSize = true;
             rbPort.Location = new Point(150, 12);
             rbPort.CheckedChanged += ModeChanged;
             top.Controls.Add(rbPort);
 
             cmbPort = new ComboBox();
-            cmbPort.DropDownStyle = ComboBoxStyle.DropDown;
+            cmbPort.DropDownStyle = ComboBoxStyle.DropDownList;   // 只从识别结果里选，避免手打出错
             cmbPort.Location = new Point(242, 10);
             cmbPort.Width = 96;
             top.Controls.Add(cmbPort);
@@ -520,7 +520,7 @@ namespace ZhSerial
 
             RefreshPorts();
             SetModeEnabled(false);
-            PrintSys("就绪。MP 连接模式下会监听 MP 与飞控之间的全部收发报文。");
+            PrintSys("就绪。「MP 当前连接」直接看 MP 与飞控的收发；「飞控串口」自动定位飞控所在串口，可抓原始字节与打印。");
         }
 
         DataGridViewTextBoxColumn AddCol(string text, int width)
@@ -559,8 +559,8 @@ namespace ZhSerial
             if (portMode)
             {
                 DetachMp();
-                SetState("独立串口模式：选择串口与波特率后点「打开」");
-                PrintSys("切换到独立串口模式");
+                SetState("飞控串口模式：已自动定位飞控串口，确认波特率后点「打开」");
+                PrintSys("切换到飞控串口模式（自动定位 MP 对应的串口）");
             }
             else
             {
@@ -795,32 +795,239 @@ namespace ZhSerial
             return sb.ToString();
         }
 
-        // ═══════════════════════ 独立串口 ═══════════════════════
+        // ═══════════════════════ 飞控串口（自动识别） ═══════════════════════
 
+        // 下拉项：COM3   ★ 飞控（MP 正在使用）
+        class PortItem
+        {
+            public string Name = "";
+            public string Note = "";
+            public override string ToString()
+            {
+                return Note.Length == 0 ? Name : Name + "   " + Note;
+            }
+        }
+
+        string SelectedPortName()
+        {
+            if (cmbPort == null) return "";
+            PortItem it = cmbPort.SelectedItem as PortItem;
+            if (it != null) return it.Name;
+            return cmbPort.Text == null ? "" : cmbPort.Text.Trim();
+        }
+
+        // MP 当前正打开着的串口
+        static string LiveMpPort()
+        {
+            try
+            {
+                if (MainV2.comPort != null && MainV2.comPort.BaseStream != null && MainV2.comPort.BaseStream.IsOpen)
+                    return MainV2.comPort.BaseStream.PortName;
+            }
+            catch { }
+            return "";
+        }
+
+        // MP 配置里记着的串口（上次连接用的）
+        static string CfgMpPort()
+        {
+            try
+            {
+                string s = MissionPlanner.Utilities.Settings.Instance["comport"];
+                if (s == null) return "";
+                return s.Trim();
+            }
+            catch { }
+            return "";
+        }
+
+        // 从注册表 SERIALCOMM 判断哪些是 USB 转串口（飞控/数传基本都是 USB 虚拟串口）
+        static HashSet<string> UsbSerialPorts()
+        {
+            HashSet<string> set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using (Microsoft.Win32.RegistryKey k =
+                    Microsoft.Win32.Registry.LocalMachine.OpenSubKey("HARDWARE\\DEVICEMAP\\SERIALCOMM"))
+                {
+                    if (k != null)
+                    {
+                        string[] names = k.GetValueNames();
+                        for (int i = 0; i < names.Length; i++)
+                        {
+                            string dev = names[i] == null ? "" : names[i].ToUpperInvariant();
+                            if (dev.IndexOf("USBSER") < 0 && dev.IndexOf("VCP") < 0 && dev.IndexOf("USB") < 0) continue;
+                            string port = Convert.ToString(k.GetValue(names[i]));
+                            if (!string.IsNullOrEmpty(port)) set.Add(port.Trim());
+                        }
+                    }
+                }
+            }
+            catch { }
+            return set;
+        }
+
+        static int PortNumber(string name)
+        {
+            if (name == null) return 0;
+            StringBuilder d = new StringBuilder();
+            for (int i = 0; i < name.Length; i++)
+                if (name[i] >= '0' && name[i] <= '9') d.Append(name[i]);
+            return ToInt(d.ToString(), 0);
+        }
+
+        // 列出串口：飞控相关排前面并打星，其余按串口号排
         void RefreshPorts()
         {
             if (cmbPort == null) return;
-            string keep = cmbPort.Text;
-            try
+            string keep = SelectedPortName();
+            string[] names = new string[0];
+            try { names = System.IO.Ports.SerialPort.GetPortNames(); }
+            catch (Exception ex) { SetState("枚举串口失败：" + ex.Message); return; }
+
+            string live = LiveMpPort();
+            string cfg = CfgMpPort();
+            HashSet<string> usb = UsbSerialPorts();
+
+            List<PortItem> fc = new List<PortItem>();
+            List<PortItem> usbList = new List<PortItem>();
+            List<PortItem> other = new List<PortItem>();
+
+            for (int i = 0; i < names.Length; i++)
             {
-                string[] names = System.IO.Ports.SerialPort.GetPortNames();
-                cmbPort.Items.Clear();
-                for (int i = 0; i < names.Length; i++) cmbPort.Items.Add(names[i]);
-                if (names.Length > 0)
+                PortItem it = new PortItem();
+                it.Name = names[i];
+                if (sp != null && string.Compare(names[i], sp.PortName, true) == 0)
                 {
-                    if (keep.Length > 0 && Array.IndexOf(names, keep) >= 0) cmbPort.Text = keep;
-                    else cmbPort.Text = names[names.Length - 1];
+                    it.Note = "● 正在监听";
+                    fc.Add(it);
+                }
+                else if (live.Length > 0 && string.Compare(names[i], live, true) == 0)
+                {
+                    it.Note = "★ 飞控（MP 正在使用）";
+                    fc.Add(it);
+                }
+                else if (cfg.Length > 0 && string.Compare(names[i], cfg, true) == 0)
+                {
+                    it.Note = "★ 飞控（MP 上次连接）";
+                    fc.Add(it);
+                }
+                else if (usb.Contains(names[i]))
+                {
+                    it.Note = "USB 串口";
+                    usbList.Add(it);
+                }
+                else other.Add(it);
+            }
+
+            SortByPortNo(fc);
+            SortByPortNo(usbList);
+            SortByPortNo(other);
+
+            cmbPort.BeginUpdate();
+            cmbPort.Items.Clear();
+            for (int i = 0; i < fc.Count; i++) cmbPort.Items.Add(fc[i]);
+            for (int i = 0; i < usbList.Count; i++) cmbPort.Items.Add(usbList[i]);
+            for (int i = 0; i < other.Count; i++) cmbPort.Items.Add(other[i]);
+            cmbPort.EndUpdate();
+
+            // 默认选中：上次选的 → MP 正在用的 → MP 配置的 → 第一个
+            string want = keep;
+            if (want.Length == 0) want = live;
+            if (want.Length == 0) want = cfg;
+            if (want.Length == 0 && cmbPort.Items.Count > 0) want = ((PortItem)cmbPort.Items[0]).Name;
+            SelectPort(want);
+        }
+
+        static void SortByPortNo(List<PortItem> list)
+        {
+            for (int i = 1; i < list.Count; i++)
+            {
+                PortItem cur = list[i];
+                int j = i - 1;
+                while (j >= 0 && PortNumber(list[j].Name) > PortNumber(cur.Name))
+                {
+                    list[j + 1] = list[j];
+                    j--;
+                }
+                list[j + 1] = cur;
+            }
+        }
+
+        void SelectPort(string name)
+        {
+            if (cmbPort == null || name == null) return;
+            for (int i = 0; i < cmbPort.Items.Count; i++)
+            {
+                PortItem it = cmbPort.Items[i] as PortItem;
+                if (it != null && string.Compare(it.Name, name, true) == 0)
+                {
+                    cmbPort.SelectedIndex = i;
+                    return;
                 }
             }
-            catch (Exception ex) { SetState("枚举串口失败：" + ex.Message); }
+            if (cmbPort.Items.Count > 0) cmbPort.SelectedIndex = 0;
         }
 
         void OpenPort()
         {
             if (sp != null) return;
-            string name = cmbPort.Text == null ? "" : cmbPort.Text.Trim();
-            if (name.Length == 0) { SetState("请先选择串口"); return; }
+            string name = SelectedPortName();
+            if (name.Length == 0) { SetState("请先选择飞控对应的串口"); return; }
             int baud = ToInt(cmbBaud.Text, 57600);
+            if (!TryOpen(name, baud))
+            {
+                // 被 MP 占着：问一次要不要接管
+                if (!IsPortBusy) return;
+                string live = LiveMpPort();
+                string tip = "串口 " + name + " 正被 Mission Planner 占用。\r\n\r\n"
+                    + "是否断开 MP 与飞控的连接，把该串口交给监听工具？\r\n"
+                    + "（之后在 MP 里点「连接」可恢复）";
+                if (live.Length > 0 && string.Compare(live, name, true) != 0)
+                    tip = "串口 " + name + " 正被其它程序占用。\r\n\r\n请先关闭占用它的程序后重试。";
+                if (live.Length > 0 && string.Compare(live, name, true) == 0)
+                {
+                    if (MessageBox.Show(fm, tip, "串口被占用", MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Warning) != DialogResult.Yes)
+                    {
+                        SetState("已取消：串口 " + name + " 仍被 MP 占用");
+                        return;
+                    }
+                    try { DetachMp(); } catch { }
+                    try { MainV2.comPort.Close(); } catch { }
+                    Thread.Sleep(400);
+                    if (!TryOpen(name, baud))
+                    {
+                        SetState("接管失败：" + LastOpenError);
+                        PrintSys("接管 " + name + " 失败：" + LastOpenError);
+                        return;
+                    }
+                }
+                else
+                {
+                    MessageBox.Show(fm, tip, "串口被占用", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+            lock (rbuf) rbuf.Clear();
+            running = true;
+            th = new Thread(ReadLoop);
+            th.IsBackground = true;
+            th.Name = "zh-serial-read";
+            th.Start();
+            try { btnOpen.Text = "关闭"; } catch { }
+            SetState("已打开 " + name + " @ " + baud);
+            PrintSys("打开串口 " + name + " @ " + baud);
+            if (rbPort != null) RefreshPorts();
+        }
+
+        bool IsPortBusy;
+        string LastOpenError = "";
+
+        bool TryOpen(string name, int baud)
+        {
+            IsPortBusy = false;
+            LastOpenError = "";
             try
             {
                 System.IO.Ports.SerialPort p = new System.IO.Ports.SerialPort();
@@ -834,23 +1041,21 @@ namespace ZhSerial
                 try { p.ReadBufferSize = 65536; } catch { }
                 p.Open();
                 sp = p;
+                return true;
             }
             catch (Exception ex)
             {
                 sp = null;
+                LastOpenError = ex.Message;
+                // 拒绝访问 / 已被占用
+                string m = ex.Message == null ? "" : ex.Message.ToUpperInvariant();
+                if (ex is UnauthorizedAccessException || m.IndexOf("ACCESS") >= 0 || m.IndexOf("拒绝") >= 0
+                    || m.IndexOf("BUSY") >= 0 || m.IndexOf("占用") >= 0)
+                    IsPortBusy = true;
                 SetState("打开 " + name + " 失败：" + ex.Message);
                 PrintSys("打开 " + name + " 失败：" + ex.Message);
-                return;
+                return false;
             }
-            lock (rbuf) rbuf.Clear();
-            running = true;
-            th = new Thread(ReadLoop);
-            th.IsBackground = true;
-            th.Name = "zh-serial-read";
-            th.Start();
-            try { btnOpen.Text = "关闭"; } catch { }
-            SetState("已打开 " + name + " @ " + baud);
-            PrintSys("打开串口 " + name + " @ " + baud);
         }
 
         void ClosePort()
@@ -1028,8 +1233,8 @@ namespace ZhSerial
         void ScanBaud()
         {
             if (sp != null) { SetState("请先关闭当前串口再扫描"); return; }
-            string name = cmbPort.Text == null ? "" : cmbPort.Text.Trim();
-            if (name.Length == 0) { SetState("请先选择串口"); return; }
+            string name = SelectedPortName();
+            if (name.Length == 0) { SetState("请先选择飞控对应的串口"); return; }
             int[] cand = new int[] { 115200, 57600, 921600, 460800, 230400, 38400, 19200, 9600, 1500000, 2000000 };
             SetState("正在扫描波特率…");
             StringBuilder cl = new StringBuilder();
@@ -1532,8 +1737,8 @@ namespace ZhSerial
             if (lblSrc == null || lblSrc.IsDisposed) return;
             if (rbPort != null && rbPort.Checked)
             {
-                if (sp != null) lblSrc.Text = "独立：" + sp.PortName + " @ " + sp.BaudRate;
-                else lblSrc.Text = "独立：未打开";
+                if (sp != null) lblSrc.Text = "飞控串口：" + sp.PortName + " @ " + sp.BaudRate;
+                else lblSrc.Text = "飞控串口：未打开";
                 return;
             }
             string t = "MP：未连接";
