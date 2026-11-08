@@ -15,7 +15,7 @@
 | `feature/mp-cn` | **MP 中文化**：界面汉化、品牌替换、中文参数表、菜单汉化、快捷视图汉化 | `mp-cn/` | v1.1 |
 | `feature/ecu-panel` | **玄云 ECU 控件**：飞行数据页 ECU 面板（转速/排气温度/推力/油量等遥测 + 双向控制） | `ecu-panel/` | v1.2 |
 | `feature/net-panel` | **飞控网口调试控件**：NET_P1~P4 四个网口读写、高亮、通讯指示、抓包监听 | `net-panel/` | v1.1 |
-| `feature/serial-monitor` | **飞控串口监听工具**：收发报文列表、字段/十六进制详情、STATUSTEXT 与 ASCII 打印、过滤/保存/导出、独立串口嗅探 + 波特率自动扫描 | `serial-monitor/` | v1.0 |
+| `feature/serial-monitor` | **飞控串口监听工具**：收发报文列表、字段/十六进制详情、STATUSTEXT 与 ASCII 打印、过滤/保存/导出、飞控串口自动识别（可接管 MP 串口）+ 波特率自动扫描 | `serial-monitor/` | v1.0 |
 
 工作方式：
 
