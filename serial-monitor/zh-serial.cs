@@ -1,4 +1,4 @@
-// zh-serial.cs —— 遥测通信监听 v1.1
+// zh-serial.cs —— 遥测通信监听 v1.2
 // 监听 MP 与飞控之间的 MAVLink 收发（双向），并提供：
 //   · 报文列表（时间/方向/消息/ID/系统组件/序号/长度/摘要）+ 字段反射与十六进制详情
 //   · 消息类型过滤（单选 / 多选）、方向过滤、关键字过滤、只看文本
@@ -55,7 +55,7 @@ namespace ZhSerial
     public class ZhSerialPlugin : MissionPlanner.Plugin.Plugin
     {
         public override string Name { get { return "ZhSerial"; } }
-        public override string Version { get { return "1.1"; } }
+        public override string Version { get { return "1.2"; } }
         public override string Author { get { return "local"; } }
 
         const int MaxRows = 5000;         // 列表保留行数
@@ -78,7 +78,8 @@ namespace ZhSerial
         ComboBox cmbMsgType, cmbDir;
         CheckBox chkTextOnly, chkAutoScroll, chkTopMost;
         Button btnPause, btnClear, btnSave, btnRaw, btnPickType;
-        Label lblSrc, lblState;
+        Label lblSrc;
+        ToolStripStatusLabel lblState;   // 状态放底部状态栏：顶部右锚定会被别的控件压住、长文字会被窗口截断
         ToolStripStatusLabel lblCnt, lblRate;
 
         // 发送页
@@ -359,6 +360,8 @@ namespace ZhSerial
             cmbMsgType.DropDownStyle = ComboBoxStyle.DropDownList;
             cmbMsgType.Location = new Point(324, 46);
             cmbMsgType.Width = 168;
+            cmbMsgType.DropDownWidth = 300;
+            cmbMsgType.DropDownHeight = 300;
             cmbMsgType.Items.Add("全部消息类型");
             cmbMsgType.SelectedIndex = 0;
             cmbMsgType.SelectedIndexChanged += delegate { OnTypeChanged(); };
@@ -393,13 +396,7 @@ namespace ZhSerial
             chkAutoScroll.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             top.Controls.Add(chkAutoScroll);
 
-            lblState = new Label();
-            lblState.Text = "就绪";
-            lblState.AutoSize = true;
-            lblState.Location = new Point(868, 49);
-            lblState.ForeColor = Color.FromArgb(0, 110, 0);
-            lblState.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            top.Controls.Add(lblState);
+            // （状态文字已移到底部状态栏）
 
             // ── 页签 ──
             tabs = new TabControl();
@@ -507,8 +504,12 @@ namespace ZhSerial
             lblCnt = new ToolStripStatusLabel("收 0 / 发 0");
             lblRate = new ToolStripStatusLabel("0 B/s");
             lblRate.BorderSides = ToolStripStatusLabelBorderSides.Left;
+            lblState = new ToolStripStatusLabel("就绪");
+            lblState.BorderSides = ToolStripStatusLabelBorderSides.Left;
+            lblState.ForeColor = Color.FromArgb(0, 110, 0);
             ss.Items.Add(lblCnt);
             ss.Items.Add(lblRate);
+            ss.Items.Add(lblState);
             fm.Controls.Add(ss);
 
             uiTimer = new System.Windows.Forms.Timer();
@@ -807,7 +808,7 @@ namespace ZhSerial
                 u.Text = unit;
                 u.AutoSize = true;
                 u.ForeColor = Color.FromArgb(90, 90, 90);
-                u.Location = new Point(276, argY + 5);
+                u.Location = new Point(284, argY + 5);
                 pnlArgs.Controls.Add(u);
             }
             argY += 30;
@@ -934,8 +935,8 @@ namespace ZhSerial
                     {
                         NumericUpDown lat = ArgNum("目标纬度", 0, -90, 90, 7, "度");
                         NumericUpDown lon = ArgNum("目标经度", 0, -180, 180, 7, "度");
-                        NumericUpDown alt = ArgNum("目标高度", 30, -1, 10000, 0, "米（-1 = 保持当前）");
-                        NumericUpDown spd = ArgNum("飞行速度", -1, -1, 50, 1, "m/s（-1 = 用当前速度）");
+                        NumericUpDown alt = ArgNum("目标高度", 30, -1, 10000, 0, "米，-1 = 保持当前");
+                        NumericUpDown spd = ArgNum("飞行速度", -1, -1, 50, 1, "m/s，-1 = 用当前");
                         Reg(4, delegate { return (float)lat.Value; });
                         Reg(5, delegate { return (float)lon.Value; });
                         Reg(6, delegate { return (float)alt.Value; });
@@ -1525,6 +1526,15 @@ namespace ZhSerial
             return Color.Black;
         }
 
+        // STATUSTEXT 行的浅底：深色字必须配浅色底，MP 深色主题下才可读
+        static Color SevRowBg(int s)
+        {
+            if (s <= 3) return Color.FromArgb(255, 232, 232);
+            if (s == 4) return Color.FromArgb(255, 244, 224);
+            if (s == 5) return Color.FromArgb(228, 238, 252);
+            return Color.White;
+        }
+
         static string FmtVal(object v)
         {
             if (v == null) return "null";
@@ -1667,7 +1677,12 @@ namespace ZhSerial
             row.Cells[6].Value = r.Len.ToString();
             row.Cells[7].Value = r.Content;
             row.Tag = r;
-            if (r.Sent) row.DefaultCellStyle.BackColor = Color.FromArgb(238, 245, 255);
+            if (r.Sent)
+            {
+                // 自己上底色的行必须同时上字色，否则 MP 深色主题的白字落在浅底上
+                row.DefaultCellStyle.BackColor = Color.FromArgb(238, 245, 255);
+                row.DefaultCellStyle.ForeColor = Color.Black;
+            }
             else if (r.Name == "STATUSTEXT")
             {
                 int sev = 6;
@@ -1679,6 +1694,7 @@ namespace ZhSerial
                         if (fs[i].Name == "severity") sev = ToIntVal(SafeGet(fs[i], d), 6);
                 }
                 row.DefaultCellStyle.ForeColor = SevColor(sev);
+                row.DefaultCellStyle.BackColor = SevRowBg(sev);   // 深色字配浅底，不依赖主题
             }
         }
 
@@ -1706,7 +1722,8 @@ namespace ZhSerial
 
         void SetState(string s)
         {
-            try { if (lblState != null && !lblState.IsDisposed) lblState.Text = s; } catch { }
+            // ToolStripStatusLabel 不是 Control，没有 IsDisposed
+            try { if (lblState != null) lblState.Text = s; } catch { }
         }
 
         void ClearAll()
