@@ -12,7 +12,7 @@ if not exist "C:\Program Files (x86)\Mission Planner\plugins\zh-serial.cs" (
 echo [成功] 已复制：
 for %%F in ("C:\Program Files (x86)\Mission Planner\plugins\zh-serial.cs") do echo        %%~zF 字节  %%~tF  zh-serial.cs
 echo.
-echo 提示：装好后在 MP「飞行数据」页工具栏勾选「串口监听」。抓包监听不需要管理员权限。
+echo 提示：装好后在 MP「飞行数据」页工具栏勾选「遥测通信监听」（在「飞控网口」右侧）。
 echo.
 choice /c YN /n /m "现在自动重启 Mission Planner 吗？(Y=是  N=否，我手动重启) "
 if errorlevel 2 goto :end
