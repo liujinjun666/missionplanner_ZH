@@ -19,6 +19,17 @@
 - 打包 → `main` 验证通过后合并到 `release`，在 `release` 上出包并打发布标签（流程见 `RELEASE.md`）；
 - 每个分支根目录有 `FEATURE.md`，写明职责、涉及文件、验收点，避免改串模块。
 
+**分支内容互相独立**：三个 `feature/*` 分支只放本模块的文件（打开分支只能看到该模块的源码与说明），
+不是"各复制一份完整集成版"。各自的 `README.md` 里写了同步命令，例如：
+
+```bash
+git switch main
+git checkout feature/net-panel -- zh-net.cs 一键部署zh-net插件.bat
+git commit -m "net: 同步网口控件改动"
+```
+
+完整集成版（全部文件）只在 `main`，打包在 `release`。
+
 ### 提交信息规范
 
 统一 `<模块>: <做了什么>`，模块前缀固定四个：
