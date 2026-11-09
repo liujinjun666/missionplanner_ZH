@@ -1,4 +1,4 @@
-// zh-serial.cs —— 遥测通信监听 v1.2
+// zh-serial.cs —— 遥测通信监听 v1.3
 // 监听 MP 与飞控之间的 MAVLink 收发（双向），并提供：
 //   · 报文列表（时间/方向/消息/ID/系统组件/序号/长度/摘要）+ 字段反射与十六进制详情
 //   · 消息类型过滤（单选 / 多选）、方向过滤、关键字过滤、只看文本
@@ -55,7 +55,7 @@ namespace ZhSerial
     public class ZhSerialPlugin : MissionPlanner.Plugin.Plugin
     {
         public override string Name { get { return "ZhSerial"; } }
-        public override string Version { get { return "1.2"; } }
+        public override string Version { get { return "1.3"; } }
         public override string Author { get { return "local"; } }
 
         const int MaxRows = 5000;         // 列表保留行数
@@ -514,7 +514,7 @@ namespace ZhSerial
 
             uiTimer = new System.Windows.Forms.Timer();
             uiTimer.Interval = 200;
-            uiTimer.Tick += delegate { Flush(); };
+            uiTimer.Tick += delegate { Flush(); EnforceArgsLight(); };
             uiTimer.Start();
 
             PrintSys("就绪。监听 MP 当前连接的全部收发报文；「发送」页可直接下发 MAV_CMD 命令与写参数。");
@@ -782,6 +782,7 @@ namespace ZhSerial
             l.Text = text;
             l.AutoSize = true;
             l.ForeColor = Color.Black;
+            l.BackColor = Color.White;   // 显式白底，防主题把容器刷深后黑字糊底
             l.Location = new Point(10, argY + 5);
             pnlArgs.Controls.Add(l);
         }
@@ -801,6 +802,7 @@ namespace ZhSerial
             n.Location = new Point(160, argY);
             n.Width = 110;
             n.ForeColor = Color.Black;
+            n.BackColor = Color.White;
             pnlArgs.Controls.Add(n);
             if (unit != null)
             {
@@ -808,6 +810,7 @@ namespace ZhSerial
                 u.Text = unit;
                 u.AutoSize = true;
                 u.ForeColor = Color.FromArgb(90, 90, 90);
+                u.BackColor = Color.White;
                 u.Location = new Point(284, argY + 5);
                 pnlArgs.Controls.Add(u);
             }
@@ -828,6 +831,8 @@ namespace ZhSerial
                 if (Math.Abs(vals[i] - def) < 0.001f) { sel = i; break; }
             c.SelectedIndex = sel;
             c.Tag = vals;
+            c.ForeColor = Color.Black;
+            c.BackColor = Color.White;
             pnlArgs.Controls.Add(c);
             argY += 30;
             return c;
@@ -840,6 +845,7 @@ namespace ZhSerial
             b.AutoSize = true;
             b.Checked = def;
             b.ForeColor = Color.Black;
+            b.BackColor = Color.White;
             b.Location = new Point(10, argY + 2);
             pnlArgs.Controls.Add(b);
             argY += 28;
@@ -853,6 +859,7 @@ namespace ZhSerial
             l.AutoSize = false;
             l.Size = new Size(640, 32);
             l.ForeColor = Color.FromArgb(150, 70, 0);
+            l.BackColor = Color.White;
             l.Location = new Point(10, argY + 2);
             pnlArgs.Controls.Add(l);
             argY += 36;
@@ -1100,6 +1107,21 @@ namespace ZhSerial
 
             pnlArgs.ResumeLayout();
             pnlArgs.AutoScrollPosition = new Point(0, 0);
+            EnforceArgsLight();
+        }
+
+        // 参数区固定「白底黑字卡片」。MP 深色主题会把容器背景刷成深色，
+        // 而控件字色是我们设的黑字 → 黑字糊在深底上（241 校准勾选框就翻过车）。
+        // 主题什么时候动手不确定，所以除建控件时显式设白底外，每 200ms 再校正一次容器。
+        void EnforceArgsLight()
+        {
+            try
+            {
+                if (pnlArgs == null || pnlArgs.IsDisposed || !pnlArgs.IsHandleCreated) return;
+                if (pnlArgs.BackColor.ToArgb() != Color.White.ToArgb())
+                    pnlArgs.BackColor = Color.White;
+            }
+            catch { }
         }
 
         bool EnsureConnected()
