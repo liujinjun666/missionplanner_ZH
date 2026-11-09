@@ -1,4 +1,4 @@
-// zh-serial.cs —— 遥测通信监听 v1.3
+// zh-serial.cs —— 遥测通信监听 v1.4
 // 监听 MP 与飞控之间的 MAVLink 收发（双向），并提供：
 //   · 报文列表（时间/方向/消息/ID/系统组件/序号/长度/摘要）+ 字段反射与十六进制详情
 //   · 消息类型过滤（单选 / 多选）、方向过滤、关键字过滤、只看文本
@@ -55,7 +55,7 @@ namespace ZhSerial
     public class ZhSerialPlugin : MissionPlanner.Plugin.Plugin
     {
         public override string Name { get { return "ZhSerial"; } }
-        public override string Version { get { return "1.3"; } }
+        public override string Version { get { return "1.4"; } }
         public override string Author { get { return "local"; } }
 
         const int MaxRows = 5000;         // 列表保留行数
@@ -88,6 +88,13 @@ namespace ZhSerial
         Panel pnlArgs;                                   // 命令专属参数区（按所选命令重建）
         readonly List<KeyValuePair<int, Func<float>>> argGet = new List<KeyValuePair<int, Func<float>>>();
         int argY;
+        // 参数区配色跟随 MP 主题：深色主题→深底浅字（与窗口融为一体），浅色→白底黑字
+        Color argBg = Color.White;
+        Color argFore = Color.Black;
+        Color argSub = Color.FromArgb(90, 90, 90);
+        Color argNote = Color.FromArgb(150, 70, 0);
+        readonly Dictionary<Control, Color> argForeMap = new Dictionary<Control, Color>();
+        readonly Dictionary<Control, Color> argBackMap = new Dictionary<Control, Color>();
         Label lblSent;
         TextBox txtParamName;
         NumericUpDown numParamValue;
@@ -514,7 +521,7 @@ namespace ZhSerial
 
             uiTimer = new System.Windows.Forms.Timer();
             uiTimer.Interval = 200;
-            uiTimer.Tick += delegate { Flush(); EnforceArgsLight(); };
+            uiTimer.Tick += delegate { Flush(); EnforceArgsColors(); };
             uiTimer.Start();
 
             PrintSys("就绪。监听 MP 当前连接的全部收发报文；「发送」页可直接下发 MAV_CMD 命令与写参数。");
@@ -671,7 +678,8 @@ namespace ZhSerial
             pnlArgs.Size = new Size(682, 238);
             pnlArgs.AutoScroll = true;
             pnlArgs.BorderStyle = BorderStyle.FixedSingle;
-            pnlArgs.BackColor = Color.White;
+            ComputeArgTheme();
+            pnlArgs.BackColor = argBg;
             g1.Controls.Add(pnlArgs);
 
             Button btnSend = new Button();
@@ -781,8 +789,7 @@ namespace ZhSerial
             Label l = new Label();
             l.Text = text;
             l.AutoSize = true;
-            l.ForeColor = Color.Black;
-            l.BackColor = Color.White;   // 显式白底，防主题把容器刷深后黑字糊底
+            ArgStyle(l, argFore);
             l.Location = new Point(10, argY + 5);
             pnlArgs.Controls.Add(l);
         }
@@ -801,16 +808,14 @@ namespace ZhSerial
             n.Value = v;
             n.Location = new Point(160, argY);
             n.Width = 110;
-            n.ForeColor = Color.Black;
-            n.BackColor = Color.White;
+            ArgStyle(n, argFore);
             pnlArgs.Controls.Add(n);
             if (unit != null)
             {
                 Label u = new Label();
                 u.Text = unit;
                 u.AutoSize = true;
-                u.ForeColor = Color.FromArgb(90, 90, 90);
-                u.BackColor = Color.White;
+                ArgStyle(u, argSub);
                 u.Location = new Point(284, argY + 5);
                 pnlArgs.Controls.Add(u);
             }
@@ -831,8 +836,7 @@ namespace ZhSerial
                 if (Math.Abs(vals[i] - def) < 0.001f) { sel = i; break; }
             c.SelectedIndex = sel;
             c.Tag = vals;
-            c.ForeColor = Color.Black;
-            c.BackColor = Color.White;
+            ArgStyle(c, argFore);
             pnlArgs.Controls.Add(c);
             argY += 30;
             return c;
@@ -844,8 +848,7 @@ namespace ZhSerial
             b.Text = label;
             b.AutoSize = true;
             b.Checked = def;
-            b.ForeColor = Color.Black;
-            b.BackColor = Color.White;
+            ArgStyle(b, argFore);
             b.Location = new Point(10, argY + 2);
             pnlArgs.Controls.Add(b);
             argY += 28;
@@ -858,8 +861,7 @@ namespace ZhSerial
             l.Text = text;
             l.AutoSize = false;
             l.Size = new Size(640, 32);
-            l.ForeColor = Color.FromArgb(150, 70, 0);
-            l.BackColor = Color.White;
+            ArgStyle(l, argNote);
             l.Location = new Point(10, argY + 2);
             pnlArgs.Controls.Add(l);
             argY += 36;
@@ -896,6 +898,9 @@ namespace ZhSerial
         void BuildArgs(int cmdId)
         {
             argGet.Clear();
+            argForeMap.Clear();
+            argBackMap.Clear();
+            ComputeArgTheme();
             argY = 6;
             pnlArgs.SuspendLayout();
             while (pnlArgs.Controls.Count > 0)
@@ -1107,19 +1112,62 @@ namespace ZhSerial
 
             pnlArgs.ResumeLayout();
             pnlArgs.AutoScrollPosition = new Point(0, 0);
-            EnforceArgsLight();
+            EnforceArgsColors();
         }
 
-        // 参数区固定「白底黑字卡片」。MP 深色主题会把容器背景刷成深色，
-        // 而控件字色是我们设的黑字 → 黑字糊在深底上（241 校准勾选框就翻过车）。
-        // 主题什么时候动手不确定，所以除建控件时显式设白底外，每 200ms 再校正一次容器。
-        void EnforceArgsLight()
+        // 参数区配色跟随 MP 主题：以主窗口背景亮度判断深浅。
+        // 深色主题 → 深底浅字（与窗口融为一体，不再塞白卡片）；浅色 → 白底黑字。
+        // 主题改容器背景的时机不定，所以除了建控件时设置，每 200ms 也校正一次。
+        void ComputeArgTheme()
+        {
+            try
+            {
+                Color b = fm != null && !fm.IsDisposed ? fm.BackColor : Color.White;
+                int lum = (b.R * 299 + b.G * 587 + b.B * 114) / 1000;
+                if (lum < 110)
+                {
+                    argBg = b;                                  // 直接用主题深色，无拼接感
+                    argFore = Color.FromArgb(230, 230, 230);
+                    argSub = Color.FromArgb(150, 150, 150);
+                    argNote = Color.FromArgb(235, 160, 70);
+                }
+                else
+                {
+                    argBg = Color.White;
+                    argFore = Color.Black;
+                    argSub = Color.FromArgb(90, 90, 90);
+                    argNote = Color.FromArgb(150, 70, 0);
+                }
+            }
+            catch { }
+        }
+
+        void ArgStyle(Control c, Color fore)
+        {
+            argForeMap[c] = fore;
+            argBackMap[c] = argBg;
+            c.ForeColor = fore;
+            c.BackColor = argBg;
+        }
+
+        void EnforceArgsColors()
         {
             try
             {
                 if (pnlArgs == null || pnlArgs.IsDisposed || !pnlArgs.IsHandleCreated) return;
-                if (pnlArgs.BackColor.ToArgb() != Color.White.ToArgb())
-                    pnlArgs.BackColor = Color.White;
+                ComputeArgTheme();
+                if (pnlArgs.BackColor.ToArgb() != argBg.ToArgb())
+                    pnlArgs.BackColor = argBg;
+                List<Control> dead = null;
+                foreach (KeyValuePair<Control, Color> kv in argForeMap)
+                {
+                    Control c = kv.Key;
+                    if (c.IsDisposed) { (dead ?? (dead = new List<Control>())).Add(c); continue; }
+                    if (c.ForeColor.ToArgb() != kv.Value.ToArgb()) c.ForeColor = kv.Value;
+                    if (c.BackColor.ToArgb() != argBg.ToArgb()) c.BackColor = argBg;
+                }
+                if (dead != null)
+                    foreach (Control c in dead) { argForeMap.Remove(c); argBackMap.Remove(c); }
             }
             catch { }
         }

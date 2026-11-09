@@ -39,7 +39,7 @@ git tag -a rel-2026.11.08 -m "发布：中文化 v1.1 + ECU v1.2 + 网口 v1.1"
 - [ ] 三个插件的 `Version` 属性与面板标题版本号一致
   - `net-panel/zh-net.cs`：`Version` 返回 `1.1`，标题 `飞控网口设置 v1.1`
   - `ecu-panel/zh-ecu.cs`：`Version` / 面板标题 `v1.2`
-  - `serial-monitor/zh-serial.cs`：`Version` 返回 `1.3`，窗口标题 `遥测通信监听 v1.3`
+  - `serial-monitor/zh-serial.cs`：`Version` 返回 `1.4`，窗口标题 `遥测通信监听 v1.4`
   - `mp-cn/` 三件套：`v1.1`
 - [ ] 源码改动已从 `feature/*` 同步到 `main`（用 `git checkout feature/xxx -- 子目录/` 核对无差异）
 - [ ] 中文化语言包 / 中文参数表从交接包 `02_中文参数表_pdef`、`03_插件源码` 取最新
